@@ -83,6 +83,68 @@ def _cmd_chat(args) -> int:
     return 0
 
 
+def _cmd_serve(args) -> int:
+    from .serve import serve
+    torch.set_num_threads(args.threads)
+    serve(
+        checkpoint=args.checkpoint,
+        state_dir=args.state_dir,
+        data_dir=args.data_dir,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_browser,
+        learner_cfg=_learner_overrides(args),
+        device=args.device,
+        learning=not args.no_learn,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+    )
+    return 0
+
+
+def _cmd_quickstart(args) -> int:
+    """prepare + pretrain + launch, with defaults chosen to finish on a laptop.
+
+    This exists so that "get me something I can talk to" is one command rather
+    than three with a page of flags between them.
+    """
+    from .config import TrainConfig, preset
+    from .data import prepare
+    from .pretrain import pretrain
+
+    torch.set_num_threads(args.threads)
+    data_dir, out_dir = Path(args.data_dir), Path(args.out_dir)
+    model_cfg = preset(args.preset)
+
+    if (data_dir / "train.bin").exists() and not args.force_prepare:
+        print(f"using the corpus already in {data_dir} "
+              f"(pass --force-prepare to rebuild)")
+    else:
+        print("step 1/3  building the corpus and tokenizer ...")
+        prepare(data_dir=data_dir, vocab_size=model_cfg.vocab_size,
+                block_size=model_cfg.block_size, offline=args.offline)
+
+    print(f"\nstep 2/3  pretraining for up to {args.minutes:g} minutes "
+          f"(resumable: re-run to continue) ...")
+    train_cfg = TrainConfig(
+        batch_size=args.batch_size, max_steps=args.steps, learning_rate=args.lr,
+        warmup_steps=min(200, max(1, args.steps // 10)), max_minutes=args.minutes,
+        eval_interval=250, checkpoint_interval=250, fisher_batches=args.fisher_batches,
+    )
+    ckpt = pretrain(data_dir=data_dir, out_dir=out_dir, model_cfg=model_cfg,
+                    train_cfg=train_cfg, device=args.device)
+
+    if args.no_launch:
+        print(f"\ndone. talk to her with:  aria chat --checkpoint {ckpt}")
+        return 0
+
+    print("\nstep 3/3  starting the chat UI ...")
+    from .serve import serve
+    serve(checkpoint=ckpt, data_dir=data_dir, host=args.host, port=args.port,
+          open_browser=not args.no_browser, device=args.device)
+    return 0
+
+
 def _cmd_sample(args) -> int:
     from .pretrain import load_checkpoint
     from .sample import complete
@@ -185,6 +247,42 @@ def build_parser() -> argparse.ArgumentParser:
     ch.add_argument("--temperature", type=float, default=0.85)
     _add_learner_flags(ch)
     ch.set_defaults(func=_cmd_chat)
+
+    qs = sub.add_parser("quickstart", parents=[common],
+                        help="one command: build the data, train, and open the chat UI")
+    qs.add_argument("--data-dir", default="data")
+    qs.add_argument("--out-dir", default="runs/aria")
+    qs.add_argument("--preset", default="small", choices=["tiny", "small", "base"])
+    qs.add_argument("--minutes", type=float, default=45.0,
+                    help="wall-clock training budget; re-run to train further")
+    qs.add_argument("--steps", type=int, default=5000)
+    qs.add_argument("--batch-size", type=int, default=16)
+    qs.add_argument("--lr", type=float, default=6e-4)
+    qs.add_argument("--fisher-batches", type=int, default=64)
+    qs.add_argument("--offline", action="store_true")
+    qs.add_argument("--force-prepare", action="store_true")
+    qs.add_argument("--no-launch", action="store_true")
+    qs.add_argument("--no-browser", action="store_true")
+    qs.add_argument("--host", default="127.0.0.1")
+    qs.add_argument("--port", type=int, default=8000)
+    qs.add_argument("--device", default="cpu")
+    qs.set_defaults(func=_cmd_quickstart)
+
+    sv = sub.add_parser("serve", parents=[common],
+                        help="chat with Aria in a browser (local, no dependencies)")
+    sv.add_argument("--checkpoint", default="runs/aria/base.pt")
+    sv.add_argument("--state-dir", default=None)
+    sv.add_argument("--data-dir", default="data")
+    sv.add_argument("--host", default="127.0.0.1",
+                    help="bind address; leave as localhost unless you mean it")
+    sv.add_argument("--port", type=int, default=8000)
+    sv.add_argument("--no-browser", action="store_true")
+    sv.add_argument("--no-learn", action="store_true")
+    sv.add_argument("--max-new-tokens", type=int, default=96)
+    sv.add_argument("--temperature", type=float, default=0.85)
+    sv.add_argument("--device", default="cpu")
+    _add_learner_flags(sv)
+    sv.set_defaults(func=_cmd_serve)
 
     sm = sub.add_parser("sample", parents=[common], help="free-form completion from a prompt")
     sm.add_argument("--checkpoint", default="runs/aria/base.pt")

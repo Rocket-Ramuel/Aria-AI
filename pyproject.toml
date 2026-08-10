@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aria-ai"
+version = "0.1.0"
+description = "A small English language model that keeps learning as you talk to it."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+aria = "aria.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Rocket-Ramuel/Aria-AI"
+
+[tool.setuptools]
+packages = ["aria"]
+
+[tool.setuptools.package-data]
+aria = ["../data/seed_dialogues.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::UserWarning"]

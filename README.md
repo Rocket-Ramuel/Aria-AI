@@ -45,25 +45,78 @@ what makes this repo self-contained, not what makes it capable.
 
 ---
 
-## Quick start
+## Running it
+
+It runs on your own machine, on the CPU, for free. No API key, no account, no
+service to sign up for, and nothing is sent anywhere — the only network access
+in the whole project is `prepare` downloading the public-domain corpus once.
+
+**Requirements:** Python 3.10+ and about 2 GB of RAM. Any laptop from the last
+decade will do. macOS, Linux and Windows all work; a GPU is optional.
+
+### One command
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/Rocket-Ramuel/Aria-AI.git
+cd Aria-AI
+pip install -e .
 
-python -m aria prepare                      # fetch corpus, train BPE, build datasets
-python -m aria pretrain --preset small \
-    --steps 4000 --max-minutes 60           # train the base model
-python -m aria chat --verbose               # talk to it; it learns as you do
+aria quickstart
 ```
 
-`--verbose` prints the learner's decision after each turn, which is the point of
-the whole exercise:
+`quickstart` builds the corpus, trains the model for 45 minutes (adjust with
+`--minutes`), and opens a chat page in your browser. Training is **resumable** —
+run it again and it picks up where it stopped, so you can train in short
+sittings.
+
+In a hurry? `aria quickstart --preset tiny --minutes 5` gives you something to
+talk to almost immediately. It will not be good, but the learning machinery is
+identical and you can watch it work.
+
+### Or step by step
+
+```bash
+aria prepare                 # fetch corpus, train the BPE vocabulary, pack datasets
+aria pretrain --preset small --steps 5000 --max-minutes 60
+aria serve                   # browser UI at http://localhost:8000
+aria chat --verbose          # or stay in the terminal
+```
+
+Everything also works as `python -m aria <command>` without installing.
+
+### The browser UI
+
+`aria serve` starts a local page on `127.0.0.1:8000`. It is one inline HTML
+file served by Python's standard library — no framework, no build step, no CDN,
+so it works with the network cable unplugged. Replies stream token by token,
+and each turn shows what the learner decided.
+
+It binds to localhost. Anything typed into that page gets written into the
+model's weights and to disk, so don't put it on a public interface.
+
+### The terminal
 
 ```
 you> what is your name
 aria> my name is Aria.
 [learn] loss 3.412 -> 3.088  surprise +0.71  lr 2.4e-04  replay 6  drift 0.011
 ```
+
+That diagnostic line is the point of the whole exercise. `--verbose` turns it on.
+
+### Free GPU, if you want a bigger model
+
+[`notebooks/Aria_on_Colab.ipynb`](notebooks/Aria_on_Colab.ipynb) runs the whole
+pipeline on Google Colab's free tier. A T4 trains the `small` preset in a few
+minutes and makes the ~100M-parameter `base` preset realistic. The last cell
+packages the trained weights so you can download them and carry on locally —
+talking to Aria needs no GPU, only training benefits from one.
+
+### How slow is CPU, really?
+
+On four CPU cores, the `small` preset runs about 70 training steps per minute,
+and a chat reply takes a second or two. Each turn's learning update costs about
+as much as one more reply. It is comfortably interactive.
 
 Everything the learner accumulates lives in `runs/aria/online/`:
 
@@ -169,12 +222,14 @@ by what it learned from you.
 ## Commands
 
 ```bash
-python -m aria prepare [--vocab-size 8192] [--block-size 256] [--offline]
-python -m aria pretrain --preset {tiny,small,base} [--steps N] [--max-minutes M]
-python -m aria chat [--verbose] [--no-learn] [--learner-plasticity full]
-python -m aria sample --prompt "The " --state-dir runs/aria/online
-python -m aria teach notes.txt          # learn from a document, paragraph by paragraph
-python -m aria status                   # what the learner has been doing
+aria quickstart [--preset tiny] [--minutes 45]   # everything, in one go
+aria prepare [--vocab-size 8192] [--block-size 256] [--offline]
+aria pretrain --preset {tiny,small,base} [--steps N] [--max-minutes M]
+aria serve [--port 8000] [--no-browser]          # browser UI
+aria chat [--verbose] [--no-learn] [--learner-plasticity full]
+aria sample --prompt "The " --state-dir runs/aria/online
+aria teach notes.txt          # learn from a document, paragraph by paragraph
+aria status                   # what the learner has been doing
 ```
 
 Inside `chat`:
@@ -240,8 +295,14 @@ The surrogate pairs are not real conversations and are labelled as such in the
 code: they teach turn structure and topical continuity, nothing more. Real
 conversational competence is what the online learner is for.
 
+Blocks with near-zero sentence-punctuation density are dropped before training:
+public-domain dumps tend to carry word lists, indices and code appendices that
+teach a small model nothing. The train/validation split holds out sixteen
+evenly spaced chunks rather than one tail slice, so validation loss reflects
+the whole corpus instead of whichever source happens to be last.
+
 Bring your own corpus by dropping `.txt` files into `data/raw/` and running
-`prepare --offline`.
+`prepare --offline`. No network access is needed in that mode.
 
 ---
 
@@ -290,7 +351,10 @@ aria/
   memory.py      replay buffer and decision journal
   sample.py      generation
   chat.py        REPL
+  serve.py       local browser UI (standard library only)
   cli.py         command line
-tests/           53 tests
-data/seed_dialogues.txt   hand-written conversation seed
+  seed_dialogues.txt        hand-written conversation seed
+tests/           93 tests
+notebooks/       Colab notebook for a free GPU
+scripts/demo_learning.py  measures whether the learning actually works
 ```
