@@ -51,6 +51,22 @@ def test_kv_cache_matches_full_forward():
     assert torch.allclose(full[:, -1], out[:, -1], atol=1e-4)
 
 
+def test_chunked_prefill_matches_full_forward():
+    """Feeding the prompt in chunks must give the same answer as one pass.
+
+    This is the case where `is_causal=True` would quietly mask the wrong keys,
+    because SDPA aligns that mask to the top-left rather than to the end."""
+    m = tiny_model().eval()
+    x = torch.randint(0, CFG.vocab_size, (1, 12))
+    full, _, _ = m(x)
+
+    caches = m.empty_cache()
+    out, _, caches = m(x[:, :5], kv_caches=caches)
+    out, _, caches = m(x[:, 5:9], kv_caches=caches)
+    out, _, caches = m(x[:, 9:], kv_caches=caches)
+    assert torch.allclose(full[:, -1], out[:, -1], atol=1e-4)
+
+
 def test_ignore_index_masks_loss():
     m = tiny_model()
     x = torch.randint(0, CFG.vocab_size, (2, 8))

@@ -93,6 +93,10 @@ taken, the learning rate scales with how surprising the exchange was.
 This is both a compute saving and a regulariser: it stops the twentieth
 "hello" from getting the same twenty gradient steps as the first.
 
+If you want a step on *literally* every turn, pass
+`--learner-surprise-gate false`. Corrections made with `/correct` bypass the
+gate regardless.
+
 ### 2. Rehearsal — never train on a batch of only-new-data
 
 Catastrophic forgetting is what happens when a network is shown a stream of

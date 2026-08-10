@@ -99,14 +99,24 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        # When decoding with a cache, T == 1 and the single query legitimately
-        # attends to every cached key, so causal masking must be off.
-        is_causal = kv_cache is None or T > 1
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=is_causal,
-        )
+        # `is_causal=True` aligns its mask to the top-left, which is only what
+        # we want when the queries *are* the whole sequence. With a non-empty
+        # cache the queries sit at the end, so the mask has to be built
+        # explicitly against absolute positions — otherwise a chunked prefill
+        # silently attends to the wrong keys.
+        dropout_p = self.dropout if self.training else 0.0
+        if kv_cache is None:
+            y = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
+                                               is_causal=True)
+        elif T == 1:
+            # A single query legitimately attends to every cached key.
+            y = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        else:
+            kv_len = k.shape[2]
+            q_pos = torch.arange(kv_len - T, kv_len, device=x.device).unsqueeze(1)
+            k_pos = torch.arange(kv_len, device=x.device).unsqueeze(0)
+            y = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
+                                               attn_mask=q_pos >= k_pos)
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         return self.resid_drop(self.o_proj(y)), new_cache
 

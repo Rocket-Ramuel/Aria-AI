@@ -108,8 +108,9 @@ class LearnerConfig:
 
     # --- surprise gating ---------------------------------------------------
     # Learn from what is novel, ignore what the model already predicts well.
+    # Set surprise_gate False to take a step on literally every turn.
     surprise_gate: bool = True
-    surprise_floor: float = 0.15   # skip update if loss < ema_loss * (1 + floor)
+    surprise_floor: float = 0.05   # skip update if loss < ema_loss * (1 + floor)
     surprise_ema: float = 0.98
     lr_surprise_scale: float = 1.0  # lr multiplier = 1 + scale * normalised surprise
     max_lr_scale: float = 3.0
