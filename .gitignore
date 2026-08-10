@@ -16,3 +16,6 @@ data/meta.json
 runs/
 *.pt
 !tests/**/*.pt
+
+# Training run logs
+*.log
