@@ -1,0 +1,238 @@
+"""Offline pretraining: teach the model English before anyone talks to it.
+
+This produces `runs/<name>/base.pt`, which contains the weights, the config, the
+tokenizer, and the diagonal Fisher information used later by the online learner
+to decide which weights are safe to move.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+import torch
+
+from .config import AriaConfig, ModelConfig, TrainConfig
+from .data import ChatSet, TokenStream, mixed_batch
+from .model import GPT
+from .tokenizer import BPETokenizer
+
+
+def lr_at(step: int, cfg: TrainConfig) -> float:
+    if step < cfg.warmup_steps:
+        return cfg.learning_rate * (step + 1) / max(1, cfg.warmup_steps)
+    progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
+    progress = min(1.0, progress)
+    coeff = 0.5 * (1 + math.cos(math.pi * progress))
+    min_lr = cfg.learning_rate * cfg.min_lr_frac
+    return min_lr + coeff * (cfg.learning_rate - min_lr)
+
+
+def build_optimizer(model: GPT, cfg: TrainConfig) -> torch.optim.AdamW:
+    # Weight-decay only the matrices; norms and embeddings are left alone.
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (decay if p.dim() >= 2 else no_decay).append(p)
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": cfg.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=cfg.learning_rate,
+        betas=(cfg.beta1, cfg.beta2),
+    )
+
+
+@torch.no_grad()
+def evaluate(model: GPT, stream: TokenStream, batches: int, batch_size: int,
+             generator: torch.Generator) -> float:
+    model.eval()
+    total = 0.0
+    for _ in range(batches):
+        x, y = stream.batch(batch_size, generator)
+        _, loss, _ = model(x, y)
+        total += float(loss)
+    model.train()
+    return total / max(1, batches)
+
+
+def estimate_fisher(
+    model: GPT,
+    stream: TokenStream,
+    batches: int,
+    batch_size: int,
+    generator: torch.Generator,
+) -> dict[str, torch.Tensor]:
+    """Diagonal empirical Fisher: E[(dL/dtheta)^2] over the pretraining data.
+
+    Large entries mark weights the pretrained knowledge is sensitive to. The
+    online learner uses this to pull those weights back hard while leaving the
+    insensitive ones free to move.
+    """
+    model.eval()
+    fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()
+              if p.requires_grad}
+    for i in range(batches):
+        x, y = stream.batch(batch_size, generator)
+        model.zero_grad(set_to_none=True)
+        _, loss, _ = model(x, y)
+        loss.backward()
+        for n, p in model.named_parameters():
+            if p.grad is not None and n in fisher:
+                fisher[n] += p.grad.detach() ** 2
+    model.zero_grad(set_to_none=True)
+    for n in fisher:
+        fisher[n] /= max(1, batches)
+    model.train()
+    return fisher
+
+
+def save_checkpoint(path: Path, model: GPT, cfg: AriaConfig, tok: BPETokenizer,
+                    step: int, val_loss: float,
+                    fisher: dict[str, torch.Tensor] | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": cfg.to_dict(),
+            "tokenizer": {"specials": tok.specials, "merges": tok.merges},
+            "step": step,
+            "val_loss": val_loss,
+            "fisher": fisher,
+        },
+        path,
+    )
+
+
+def load_checkpoint(path: str | Path, device: str = "cpu"):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    cfg = AriaConfig.from_dict(ckpt["config"])
+    tok = BPETokenizer(merges=[tuple(m) for m in ckpt["tokenizer"]["merges"]],
+                       specials=ckpt["tokenizer"]["specials"])
+    model = GPT(cfg.model).to(device)
+    model.load_state_dict(ckpt["model"])
+    return model, tok, cfg, ckpt
+
+
+def pretrain(
+    data_dir: str | Path = "data",
+    out_dir: str | Path = "runs/aria",
+    model_cfg: ModelConfig | None = None,
+    train_cfg: TrainConfig | None = None,
+    chat_frac: float = 0.25,
+    resume: bool = True,
+    device: str = "cpu",
+    verbose: bool = True,
+) -> Path:
+    data_dir, out_dir = Path(data_dir), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tok = BPETokenizer.load(data_dir / "tokenizer.json")
+    model_cfg = model_cfg or ModelConfig()
+    model_cfg.vocab_size = tok.vocab_size
+    train_cfg = train_cfg or TrainConfig()
+    cfg = AriaConfig(model=model_cfg, train=train_cfg)
+
+    torch.manual_seed(train_cfg.seed)
+    rng = random.Random(train_cfg.seed)
+    gen = torch.Generator().manual_seed(train_cfg.seed)
+
+    train_stream = TokenStream(data_dir / "train.bin", model_cfg.block_size)
+    val_stream = TokenStream(data_dir / "val.bin", model_cfg.block_size)
+    chatset = ChatSet(data_dir / "chat.pt", tok.pad_id) if (data_dir / "chat.pt").exists() else None
+
+    model = GPT(model_cfg).to(device)
+    opt = build_optimizer(model, train_cfg)
+    start_step = 0
+
+    ckpt_path = out_dir / "base.pt"
+    latest = out_dir / "latest.pt"
+    if resume and latest.exists():
+        state = torch.load(latest, map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+        if "optimizer" in state:
+            opt.load_state_dict(state["optimizer"])
+        start_step = state.get("step", 0)
+        if verbose:
+            print(f"resumed from {latest} at step {start_step}", flush=True)
+
+    if verbose:
+        print(f"model: {model.num_params()/1e6:.2f}M params "
+              f"({model.num_params(non_embedding=True)/1e6:.2f}M non-embedding)", flush=True)
+        print(f"data: {len(train_stream)/1e6:.2f}M train tokens, "
+              f"{len(chatset) if chatset else 0} chat examples", flush=True)
+
+    model.train()
+    t0 = time.time()
+    log_path = out_dir / "train_log.jsonl"
+    best_val = float("inf")
+    step = start_step
+    stop_reason = "max_steps"
+
+    while step < train_cfg.max_steps:
+        lr = lr_at(step, train_cfg)
+        for group in opt.param_groups:
+            group["lr"] = lr
+
+        opt.zero_grad(set_to_none=True)
+        total_loss = 0.0
+        for _ in range(train_cfg.grad_accum):
+            x, y = mixed_batch(train_stream, chatset, train_cfg.batch_size,
+                               chat_frac, rng, gen, tok.pad_id)
+            x, y = x.to(device), y.to(device)
+            _, loss, _ = model(x, y)
+            (loss / train_cfg.grad_accum).backward()
+            total_loss += float(loss) / train_cfg.grad_accum
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+        opt.step()
+        step += 1
+
+        elapsed = (time.time() - t0) / 60.0
+        if verbose and (step % 10 == 0 or step == 1):
+            print(f"step {step}/{train_cfg.max_steps}  loss {total_loss:.4f}  "
+                  f"lr {lr:.2e}  |g| {float(grad_norm):.2f}  {elapsed:.1f}m", flush=True)
+
+        if step % train_cfg.eval_interval == 0 or step == train_cfg.max_steps:
+            val = evaluate(model, val_stream, train_cfg.eval_batches,
+                           train_cfg.batch_size, gen)
+            best_val = min(best_val, val)
+            if verbose:
+                print(f"  eval @ {step}: val loss {val:.4f}  (ppl {math.exp(min(val, 20)):.1f})",
+                      flush=True)
+            with open(log_path, "a") as f:
+                f.write(json.dumps({"step": step, "train_loss": total_loss,
+                                    "val_loss": val, "lr": lr,
+                                    "minutes": elapsed}) + "\n")
+
+        if step % train_cfg.checkpoint_interval == 0:
+            torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(),
+                        "step": step, "config": cfg.to_dict()}, latest)
+
+        if train_cfg.max_minutes and elapsed >= train_cfg.max_minutes:
+            stop_reason = "time_budget"
+            if verbose:
+                print(f"stopping at step {step}: hit the {train_cfg.max_minutes}m budget",
+                      flush=True)
+            break
+
+    final_val = evaluate(model, val_stream, train_cfg.eval_batches,
+                         train_cfg.batch_size, gen)
+    if verbose:
+        print(f"estimating Fisher information ({train_cfg.fisher_batches} batches) ...",
+              flush=True)
+    fisher = estimate_fisher(model, train_stream, train_cfg.fisher_batches,
+                             max(2, train_cfg.batch_size // 2), gen)
+
+    save_checkpoint(ckpt_path, model, cfg, tok, step, final_val, fisher)
+    torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(),
+                "step": step, "config": cfg.to_dict()}, latest)
+    if verbose:
+        print(f"saved {ckpt_path}  (step {step}, val loss {final_val:.4f}, "
+              f"stopped on {stop_reason})", flush=True)
+    return ckpt_path
