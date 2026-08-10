@@ -280,9 +280,11 @@ def prepare(
 
     if verbose:
         print("building chat examples ...", flush=True)
-    seed_path = Path(__file__).resolve().parent.parent / "data" / "seed_dialogues.txt"
+    # A seed file inside the chosen data dir wins; the one shipped with the
+    # repo is the fallback, so `--data-dir` can override it.
+    seed_path = data_dir / "seed_dialogues.txt"
     if not seed_path.exists():
-        seed_path = data_dir / "seed_dialogues.txt"
+        seed_path = Path(__file__).resolve().parent.parent / "data" / "seed_dialogues.txt"
     chat = build_chat_examples(
         tok, corpus, block_size, seed_path if seed_path.exists() else None,
         n_surrogate_dialogues, seed_repeat, rng,

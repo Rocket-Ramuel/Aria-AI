@@ -187,7 +187,7 @@ def pretrain(
             x, y = x.to(device), y.to(device)
             _, loss, _ = model(x, y)
             (loss / train_cfg.grad_accum).backward()
-            total_loss += float(loss) / train_cfg.grad_accum
+            total_loss += loss.item() / train_cfg.grad_accum
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         opt.step()

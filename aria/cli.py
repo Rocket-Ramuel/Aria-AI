@@ -135,11 +135,15 @@ def _cmd_teach(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("aria", description="A small English language model that keeps learning as you talk to it.")
-    p.add_argument("--threads", type=int, default=0,
-                   help="torch CPU threads (0 = leave as-is)")
+    # Shared flags live on a parent parser so they are accepted *after* the
+    # subcommand, which is where anyone would naturally type them.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--threads", type=int, default=0,
+                        help="torch CPU threads (0 = leave as-is)")
     sub = p.add_subparsers(dest="command", required=True)
 
-    pr = sub.add_parser("prepare", help="download the corpus, train the tokenizer, build datasets")
+    pr = sub.add_parser("prepare", parents=[common],
+                        help="download the corpus, train the tokenizer, build datasets")
     pr.add_argument("--data-dir", default="data")
     pr.add_argument("--vocab-size", type=int, default=8192)
     pr.add_argument("--block-size", type=int, default=256)
@@ -148,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="use whatever .txt files are already in data/raw/")
     pr.set_defaults(func=_cmd_prepare)
 
-    pt = sub.add_parser("pretrain", help="train the base model on the corpus")
+    pt = sub.add_parser("pretrain", parents=[common], help="train the base model on the corpus")
     pt.add_argument("--data-dir", default="data")
     pt.add_argument("--out-dir", default="runs/aria")
     pt.add_argument("--preset", default="small", choices=["tiny", "small", "base"])
@@ -169,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     pt.add_argument("--device", default="cpu")
     pt.set_defaults(func=_cmd_pretrain)
 
-    ch = sub.add_parser("chat", help="talk to Aria; she learns as you do")
+    ch = sub.add_parser("chat", parents=[common], help="talk to Aria; she learns as you do")
     ch.add_argument("--checkpoint", default="runs/aria/base.pt")
     ch.add_argument("--state-dir", default=None,
                     help="where learned weights and memory live (default <ckpt dir>/online)")
@@ -182,7 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_learner_flags(ch)
     ch.set_defaults(func=_cmd_chat)
 
-    sm = sub.add_parser("sample", help="free-form completion from a prompt")
+    sm = sub.add_parser("sample", parents=[common], help="free-form completion from a prompt")
     sm.add_argument("--checkpoint", default="runs/aria/base.pt")
     sm.add_argument("--state-dir", default=None)
     sm.add_argument("--prompt", default="The ")
@@ -191,11 +195,11 @@ def build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--device", default="cpu")
     sm.set_defaults(func=_cmd_sample)
 
-    st = sub.add_parser("status", help="report what the learner has been doing")
+    st = sub.add_parser("status", parents=[common], help="report what the learner has been doing")
     st.add_argument("--state-dir", default="runs/aria/online")
     st.set_defaults(func=_cmd_status)
 
-    te = sub.add_parser("teach", help="learn from a text file, paragraph by paragraph")
+    te = sub.add_parser("teach", parents=[common], help="learn from a text file, paragraph by paragraph")
     te.add_argument("file")
     te.add_argument("--checkpoint", default="runs/aria/base.pt")
     te.add_argument("--state-dir", default=None)

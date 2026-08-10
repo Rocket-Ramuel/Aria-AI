@@ -59,7 +59,7 @@ def test_ignore_index_masks_loss():
     _, masked, _ = m(x, y)
     _, full, _ = m(x, x)
     assert not torch.isnan(masked)
-    assert float(masked) != pytest.approx(float(full))
+    assert masked.item() != pytest.approx(full.item())
 
 
 def test_block_size_is_enforced():
@@ -159,5 +159,5 @@ def test_model_can_overfit_a_sequence():
         loss.backward()
         opt.step()
         if first is None:
-            first = float(loss)
-    assert float(loss) < first * 0.2
+            first = loss.item()
+    assert loss.item() < first * 0.2
