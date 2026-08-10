@@ -181,7 +181,9 @@ class OnlineLearner:
         for n in self.trainable_names:
             f = fisher.get(n)
             if f is not None and f.shape == named[n].shape:
-                out[n] = f.to(self.device)
+                # .float() because a half-precision export would otherwise
+                # silently make the EWC penalty half precision too.
+                out[n] = f.to(device=self.device, dtype=torch.float32)
         if out:
             # Normalise so ewc_lambda means the same thing across runs.
             total = sum(float(v.mean()) for v in out.values()) / len(out)

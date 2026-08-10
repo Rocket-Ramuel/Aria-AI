@@ -16,7 +16,7 @@ from .config import LearnerConfig
 from .data import TokenStream
 from .learner import OnlineLearner, resume_learned_weights
 from .memory import Journal
-from .pretrain import load_checkpoint
+from .pretrain import load_checkpoint, resolve_checkpoint
 from .sample import build_chat_prompt, generate
 
 HELP = """
@@ -40,7 +40,7 @@ commands:
 class ChatSession:
     def __init__(
         self,
-        checkpoint: str | Path,
+        checkpoint: str | Path | None = None,
         state_dir: str | Path | None = None,
         data_dir: str | Path = "data",
         learner_cfg: LearnerConfig | None = None,
@@ -52,7 +52,7 @@ class ChatSession:
         top_k: int = 40,
         top_p: float = 0.92,
     ) -> None:
-        checkpoint = Path(checkpoint)
+        checkpoint = resolve_checkpoint(checkpoint)
         self.state_dir = Path(state_dir or checkpoint.parent / "online")
         self.device = device
         self.learning = learning

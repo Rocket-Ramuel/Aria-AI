@@ -115,8 +115,65 @@ def load_checkpoint(path: str | Path, device: str = "cpu"):
     tok = BPETokenizer(merges=[tuple(m) for m in ckpt["tokenizer"]["merges"]],
                        specials=ckpt["tokenizer"]["specials"])
     model = GPT(cfg.model).to(device)
+    # load_state_dict casts on copy, so a half-precision export loads straight
+    # into the float32 model without any special handling here.
     model.load_state_dict(ckpt["model"])
     return model, tok, cfg, ckpt
+
+
+# Where `--checkpoint` looks when it is not given explicitly: a model you
+# trained yourself wins, then whatever ships with the repo.
+DEFAULT_CHECKPOINTS = ("runs/aria/base.pt", "checkpoints/aria-small.pt")
+
+
+def resolve_checkpoint(path: str | Path | None) -> Path:
+    if path:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"no checkpoint at {p}")
+        return p
+    for candidate in DEFAULT_CHECKPOINTS:
+        if Path(candidate).exists():
+            return Path(candidate)
+    raise FileNotFoundError(
+        "no checkpoint found. Train one with `aria quickstart`, or pass "
+        "--checkpoint explicitly. Looked in: " + ", ".join(DEFAULT_CHECKPOINTS)
+    )
+
+
+def export_checkpoint(src: str | Path, dst: str | Path, half: bool = True,
+                      keep_fisher: bool = True) -> dict:
+    """Write a compact, shareable copy of a checkpoint.
+
+    Half precision halves the file for no measurable quality cost at this size
+    (the weights are loaded back into a float32 model), which is the difference
+    between a checkpoint that is reasonable to commit and one that is not.
+    """
+    ckpt = torch.load(src, map_location="cpu", weights_only=False)
+
+    def cast(d):
+        return {k: (v.half() if half and v.is_floating_point() else v)
+                for k, v in d.items()}
+
+    out = {
+        "model": cast(ckpt["model"]),
+        "config": ckpt["config"],
+        "tokenizer": ckpt["tokenizer"],
+        "step": ckpt.get("step"),
+        "val_loss": ckpt.get("val_loss"),
+        "fisher": cast(ckpt["fisher"]) if (keep_fisher and ckpt.get("fisher")) else None,
+    }
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(out, dst)
+    return {
+        "source_mb": Path(src).stat().st_size / 1e6,
+        "export_mb": dst.stat().st_size / 1e6,
+        "half": half,
+        "fisher": out["fisher"] is not None,
+        "step": out["step"],
+        "val_loss": out["val_loss"],
+    }
 
 
 def pretrain(

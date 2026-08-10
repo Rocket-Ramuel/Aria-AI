@@ -332,7 +332,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def serve(
-    checkpoint: str | Path = "runs/aria/base.pt",
+    checkpoint: str | Path | None = None,
     state_dir: str | Path | None = None,
     data_dir: str | Path = "data",
     host: str = "127.0.0.1",

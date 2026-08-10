@@ -145,11 +145,23 @@ def _cmd_quickstart(args) -> int:
     return 0
 
 
+def _cmd_export(args) -> int:
+    from .pretrain import export_checkpoint, resolve_checkpoint
+    info = export_checkpoint(resolve_checkpoint(args.checkpoint), args.out,
+                             half=not args.full_precision,
+                             keep_fisher=not args.no_fisher)
+    print(f"wrote {args.out}")
+    print(f"  {info['source_mb']:.1f} MB -> {info['export_mb']:.1f} MB"
+          f"  (half={info['half']}, fisher={info['fisher']})")
+    print(f"  trained {info['step']} steps, val loss {info['val_loss']:.4f}")
+    return 0
+
+
 def _cmd_sample(args) -> int:
-    from .pretrain import load_checkpoint
+    from .pretrain import load_checkpoint, resolve_checkpoint
     from .sample import complete
     torch.set_num_threads(args.threads)
-    model, tok, _, _ = load_checkpoint(args.checkpoint, args.device)
+    model, tok, _, _ = load_checkpoint(resolve_checkpoint(args.checkpoint), args.device)
     from .learner import resume_learned_weights
     if args.state_dir:
         resume_learned_weights(model, args.state_dir, args.device)
@@ -236,7 +248,8 @@ def build_parser() -> argparse.ArgumentParser:
     pt.set_defaults(func=_cmd_pretrain)
 
     ch = sub.add_parser("chat", parents=[common], help="talk to Aria; she learns as you do")
-    ch.add_argument("--checkpoint", default="runs/aria/base.pt")
+    ch.add_argument("--checkpoint", default=None,
+                   help="defaults to runs/aria/base.pt, then checkpoints/aria-small.pt")
     ch.add_argument("--state-dir", default=None,
                     help="where learned weights and memory live (default <ckpt dir>/online)")
     ch.add_argument("--data-dir", default="data")
@@ -270,7 +283,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sv = sub.add_parser("serve", parents=[common],
                         help="chat with Aria in a browser (local, no dependencies)")
-    sv.add_argument("--checkpoint", default="runs/aria/base.pt")
+    sv.add_argument("--checkpoint", default=None,
+                   help="defaults to runs/aria/base.pt, then checkpoints/aria-small.pt")
     sv.add_argument("--state-dir", default=None)
     sv.add_argument("--data-dir", default="data")
     sv.add_argument("--host", default="127.0.0.1",
@@ -285,7 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     sv.set_defaults(func=_cmd_serve)
 
     sm = sub.add_parser("sample", parents=[common], help="free-form completion from a prompt")
-    sm.add_argument("--checkpoint", default="runs/aria/base.pt")
+    sm.add_argument("--checkpoint", default=None,
+                   help="defaults to runs/aria/base.pt, then checkpoints/aria-small.pt")
     sm.add_argument("--state-dir", default=None)
     sm.add_argument("--prompt", default="The ")
     sm.add_argument("--max-new-tokens", type=int, default=120)
@@ -293,13 +308,25 @@ def build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--device", default="cpu")
     sm.set_defaults(func=_cmd_sample)
 
+    ex = sub.add_parser("export", parents=[common],
+                        help="write a compact, shareable copy of a checkpoint")
+    ex.add_argument("--checkpoint", default=None)
+    ex.add_argument("--out", default="checkpoints/aria-small.pt")
+    ex.add_argument("--full-precision", action="store_true",
+                    help="keep float32 instead of halving the file size")
+    ex.add_argument("--no-fisher", action="store_true",
+                    help="drop the Fisher information (only needed for "
+                         "--learner-plasticity ffn/full)")
+    ex.set_defaults(func=_cmd_export)
+
     st = sub.add_parser("status", parents=[common], help="report what the learner has been doing")
     st.add_argument("--state-dir", default="runs/aria/online")
     st.set_defaults(func=_cmd_status)
 
     te = sub.add_parser("teach", parents=[common], help="learn from a text file, paragraph by paragraph")
     te.add_argument("file")
-    te.add_argument("--checkpoint", default="runs/aria/base.pt")
+    te.add_argument("--checkpoint", default=None,
+                   help="defaults to runs/aria/base.pt, then checkpoints/aria-small.pt")
     te.add_argument("--state-dir", default=None)
     te.add_argument("--data-dir", default="data")
     te.add_argument("--device", default="cpu")
