@@ -113,7 +113,7 @@ def main() -> int:
                   f"  drift {r.drift:.4f}")
     after_teaching = learner.sequence_loss(lesson_ex)
     drop = (before - after_teaching) / before * 100
-    print(f"  loss after teaching    {after_teaching:.4f}   ({drop:+.1f}%)")
+    print(f"  loss after teaching    {after_teaching:.4f}   ({drop:.1f}% lower)")
     acquisition_ok = after_teaching < before
 
     # ---------------------------------------------------------------- 2

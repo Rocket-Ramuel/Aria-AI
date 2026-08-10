@@ -287,6 +287,44 @@ def build_chat_examples(
 # ---------------------------------------------------------------------------
 
 
+def _seed_path(data_dir: Path) -> Path | None:
+    """A seed file inside the chosen data dir wins, so `--data-dir` can override
+    it; otherwise use the copy shipped inside the package, which is present
+    whether Aria was cloned or pip-installed."""
+    local = data_dir / "seed_dialogues.txt"
+    if local.exists():
+        return local
+    packaged = Path(__file__).resolve().parent / "seed_dialogues.txt"
+    return packaged if packaged.exists() else None
+
+
+def _rebuild_chat(data_dir: Path, block_size: int, n_surrogate: int,
+                  seed_repeat: int, rng: random.Random, verbose: bool) -> dict:
+    tok_path = data_dir / "tokenizer.json"
+    corpus_path = data_dir / "corpus.txt"
+    if not tok_path.exists() or not corpus_path.exists():
+        raise RuntimeError(
+            "--chat-only needs a tokenizer.json and corpus.txt already in "
+            f"{data_dir}; run a full `prepare` first"
+        )
+    tok = BPETokenizer.load(tok_path)
+    corpus = corpus_path.read_text(encoding="utf-8")
+    chat = build_chat_examples(tok, corpus, block_size, _seed_path(data_dir),
+                               n_surrogate, seed_repeat, rng)
+    with open(data_dir / "chat.pt", "wb") as f:
+        pickle.dump(chat, f)
+
+    meta_path = data_dir / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    meta.update({"chat_examples": len(chat), "seed_repeat": seed_repeat,
+                 "surrogate_dialogues": n_surrogate})
+    meta_path.write_text(json.dumps(meta, indent=2))
+    if verbose:
+        print(f"rebuilt chat.pt: {len(chat)} examples "
+              f"(seed x{seed_repeat}, {n_surrogate} surrogate)", flush=True)
+    return meta
+
+
 def prepare(
     data_dir: str | Path = "data",
     vocab_size: int = 8192,
@@ -294,14 +332,22 @@ def prepare(
     val_frac: float = 0.005,
     bpe_sample_bytes: int = 6_000_000,
     n_surrogate_dialogues: int = 40_000,
-    seed_repeat: int = 24,
+    seed_repeat: int = 100,
     offline: bool = False,
     seed: int = 1337,
+    chat_only: bool = False,
     verbose: bool = True,
 ) -> dict:
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
+
+    if chat_only:
+        # Rebuild only chat.pt, reusing the tokenizer and corpus already on
+        # disk. Retuning the conversation mix is a minute's work this way
+        # instead of re-running BPE and re-encoding five million tokens.
+        return _rebuild_chat(data_dir, block_size, n_surrogate_dialogues,
+                             seed_repeat, rng, verbose)
 
     if offline:
         paths = sorted((data_dir / "raw").glob("*.txt"))
@@ -343,16 +389,8 @@ def prepare(
 
     if verbose:
         print("building chat examples ...", flush=True)
-    # A seed file inside the chosen data dir wins, so `--data-dir` can override
-    # it; otherwise use the copy shipped inside the package, which is present
-    # whether Aria was cloned or pip-installed.
-    seed_path = data_dir / "seed_dialogues.txt"
-    if not seed_path.exists():
-        seed_path = Path(__file__).resolve().parent / "seed_dialogues.txt"
-    chat = build_chat_examples(
-        tok, corpus, block_size, seed_path if seed_path.exists() else None,
-        n_surrogate_dialogues, seed_repeat, rng,
-    )
+    chat = build_chat_examples(tok, corpus, block_size, _seed_path(data_dir),
+                               n_surrogate_dialogues, seed_repeat, rng)
     with open(data_dir / "chat.pt", "wb") as f:
         pickle.dump(chat, f)
 
@@ -362,6 +400,7 @@ def prepare(
         "train_tokens": int(train_arr.size),
         "val_tokens": int(val_arr.size),
         "chat_examples": len(chat),
+        "seed_repeat": seed_repeat,
         "corpus_chars": len(corpus),
         "sources": [p.name for p in paths],
     }

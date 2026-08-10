@@ -18,7 +18,9 @@ def _cmd_prepare(args) -> int:
         vocab_size=args.vocab_size,
         block_size=args.block_size,
         n_surrogate_dialogues=args.surrogate_dialogues,
+        seed_repeat=args.seed_repeat,
         offline=args.offline,
+        chat_only=args.chat_only,
     )
     return 0
 
@@ -222,6 +224,12 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--vocab-size", type=int, default=8192)
     pr.add_argument("--block-size", type=int, default=256)
     pr.add_argument("--surrogate-dialogues", type=int, default=40000)
+    pr.add_argument("--seed-repeat", type=int, default=100,
+                    help="how many times the hand-written conversation seed is "
+                         "repeated relative to surrogate dialogues")
+    pr.add_argument("--chat-only", action="store_true",
+                    help="rebuild only chat.pt from the existing tokenizer and "
+                         "corpus (fast; for retuning the conversation mix)")
     pr.add_argument("--offline", action="store_true",
                     help="use whatever .txt files are already in data/raw/")
     pr.set_defaults(func=_cmd_prepare)
