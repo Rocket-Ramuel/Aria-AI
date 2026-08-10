@@ -95,12 +95,71 @@ def clean_plain(text: str) -> str:
     return "\n".join(out)
 
 
-def build_corpus(paths: Sequence[Path]) -> str:
+def drop_non_prose(text: str, block_lines: int = 60,
+                   min_punct_per_1k: float = 3.0) -> str:
+    """Remove blocks that are not running prose.
+
+    Public-domain text dumps tend to carry appendices that are not sentences —
+    word-frequency lists, indices, tables, code. `big.txt` ends with ~145 KB of
+    one-word-per-line vocabulary, which teaches a small model nothing and
+    poisons any validation slice that lands on it.
+
+    The test is sentence-punctuation density measured over a block of lines.
+    Real prose runs around 20 marks per 1000 characters even when hard-wrapped,
+    so a threshold of 3 discards word lists without touching anything a person
+    would call text.
+    """
+    lines = text.split("\n")
+    kept: list[str] = []
+    for i in range(0, len(lines), block_lines):
+        block = lines[i : i + block_lines]
+        joined = "\n".join(block)
+        if not joined.strip():
+            continue
+        density = 1000 * sum(joined.count(c) for c in ".,!?;:") / max(1, len(joined))
+        if density >= min_punct_per_1k:
+            kept.extend(block)
+    return "\n".join(kept)
+
+
+def build_corpus(paths: Sequence[Path], filter_non_prose: bool = True) -> str:
     chunks = []
     for p in paths:
         text = p.read_text(encoding="utf-8", errors="replace")
-        chunks.append(clean_wikitext(text) if "wikitext" in p.name else clean_plain(text))
+        text = clean_wikitext(text) if "wikitext" in p.name else clean_plain(text)
+        if filter_non_prose:
+            text = drop_non_prose(text)
+        chunks.append(text)
     return "\n".join(chunks)
+
+
+def split_train_val(arr: np.ndarray, block_size: int, val_frac: float,
+                    n_chunks: int = 16) -> tuple[np.ndarray, np.ndarray]:
+    """Hold out evenly spaced contiguous slices rather than one tail slice.
+
+    A single trailing slice measures the model on whichever source happens to
+    be concatenated last, which is not what validation loss is supposed to
+    mean. Spreading the held-out chunks across the stream makes the number
+    representative of the corpus as a whole; keeping each chunk contiguous and
+    longer than the context window keeps it a fair language-modelling task.
+    """
+    n_val = max(block_size * 8, int(len(arr) * val_frac))
+    chunk = max(block_size + 1, n_val // n_chunks)
+    n_chunks = max(1, min(n_chunks, len(arr) // (chunk * 2)))
+    stride = len(arr) // n_chunks
+
+    val_parts, train_parts, cursor = [], [], 0
+    for i in range(n_chunks):
+        # Sit the held-out chunk in the middle of its stride, away from the
+        # seams where two sources meet.
+        start = i * stride + (stride - chunk) // 2
+        end = start + chunk
+        train_parts.append(arr[cursor:start])
+        val_parts.append(arr[start:end])
+        cursor = end
+    train_parts.append(arr[cursor:])
+
+    return np.concatenate(train_parts), np.concatenate(val_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +239,13 @@ def encode_dialogue(
         ids.extend(body)
         loss_on.extend([i % 2 == 1] * len(body))
 
-    ids = ids[: block_size + 1]
-    loss_on = loss_on[: block_size + 1]
+    # Truncate from the *left*. Aria's reply is at the end and is the only part
+    # that carries loss, so keeping the head would throw away the entire
+    # training signal whenever a user message runs long.
+    if len(ids) > block_size + 1:
+        ids = ids[-(block_size + 1):]
+        loss_on = loss_on[-(block_size + 1):]
+        ids[0], loss_on[0] = tok.bos_id, False
     if len(ids) < 8:
         return None
 
@@ -273,8 +337,7 @@ def prepare(
             print(f"  {min(i + step, len(lines))}/{len(lines)} lines", flush=True)
 
     arr = np.array(ids, dtype=np.uint16)
-    n_val = max(block_size * 32, int(len(arr) * val_frac))
-    train_arr, val_arr = arr[:-n_val], arr[-n_val:]
+    train_arr, val_arr = split_train_val(arr, block_size, val_frac)
     train_arr.tofile(data_dir / "train.bin")
     val_arr.tofile(data_dir / "val.bin")
 
