@@ -22,26 +22,50 @@ that.
 
 ## What you should expect from it
 
-Read this before running it, because the honest framing matters.
+Read this before running it. A model you can pretrain on a laptop CPU is **six
+to seven orders of magnitude smaller** than a frontier LLM, trained on five
+orders of magnitude less text. The shipped model is 6.5M parameters trained on
+4.85M tokens for 8000 steps, reaching a validation loss of 3.95 (perplexity
+~52). Here is what that actually looks like, unedited.
 
-A model you can pretrain on a laptop CPU in an evening is **six to seven orders
-of magnitude smaller** than a frontier LLM, trained on about five orders of
-magnitude less text. The `small` preset is ~7M parameters trained on ~4M tokens.
-What that buys you:
+**Free-running text** — grammatical, correctly spelled, structurally coherent:
 
-- **Yes:** fluent-looking English word order, correct spelling, plausible
-  syntax, topical continuity within a sentence or two, and *measurable,
-  inspectable learning from conversation* — you can watch the loss on a
-  specific exchange fall as you repeat and correct it, and confirm the change
-  persists across restarts.
+> **The river** and the western limbs of aneurysm. If this is not a result of the colour, it is no longer the chief form of infection.
+
+**Conversation on ground the seed dialogues cover** — fluent and on-topic,
+but this is largely recall: these exchanges are in
+[`aria/seed_dialogues.txt`](aria/seed_dialogues.txt), and the model has
+memorised them.
+
+> **you>** what is your name?
+> **aria>** My name is Aria.
+>
+> **you>** can you learn?
+> **aria>** Yes. Every time we talk I adjust my own weights a little, so I change over time.
+
+**Conversation off that ground** — grammatical English, no meaning:
+
+> **you>** what did you have for breakfast?
+> **aria>** It is a well-known, strong and often.
+>
+> **you>** I just finished building a bookshelf
+> **aria>** There were also seven times in the year.
+
+So, plainly:
+
+- **Yes:** real English syntax and spelling, a conversational register, and
+  *measurable, inspectable learning from conversation* — you can watch the loss
+  on a specific exchange fall as you teach it, verify that teaching forty new
+  things does not erase it, and confirm it survives a restart. Those numbers are
+  [below](#does-the-learning-actually-work), and you can reproduce them.
 - **No:** factual reliability, reasoning, instruction-following, or coherence
-  across a long reply. It will confabulate constantly. It is a demonstration of
-  a learning mechanism, not a useful assistant.
+  beyond a sentence. It confabulates constantly. It is a working demonstration
+  of a learning mechanism, not a useful assistant.
 
-If you want a model that is genuinely good at conversation *and* learns online,
-the same `aria/learner.py` will attach to a much larger pretrained model — the
-learning engine is independent of the model size. The bundled pretraining is
-what makes this repo self-contained, not what makes it capable.
+The learning engine in `aria/learner.py` does not care how big the model is —
+it will attach to a much larger pretrained one and behave the same way. The
+bundled pretraining is what makes this repo self-contained, not what makes it
+capable.
 
 ---
 
@@ -54,20 +78,34 @@ in the whole project is `prepare` downloading the public-domain corpus once.
 **Requirements:** Python 3.10+ and about 2 GB of RAM. Any laptop from the last
 decade will do. macOS, Linux and Windows all work; a GPU is optional.
 
-### One command
+### Talk to her straight away
+
+A trained model ships in the repo, so there is nothing to train before you can
+use it:
 
 ```bash
 git clone https://github.com/Rocket-Ramuel/Aria-AI.git
 cd Aria-AI
 pip install -e .
 
+aria serve      # browser UI, or `aria chat --verbose` for the terminal
+```
+
+`checkpoints/aria-small.pt` (30 MB) is the 6.5M-parameter model described
+above, stored in half precision and loaded back into a float32 model. It
+carries its own tokenizer and Fisher information, so nothing else is needed.
+
+### Train your own
+
+```bash
 aria quickstart
 ```
 
 `quickstart` builds the corpus, trains the model for 45 minutes (adjust with
 `--minutes`), and opens a chat page in your browser. Training is **resumable** —
 run it again and it picks up where it stopped, so you can train in short
-sittings.
+sittings. A model you train yourself is preferred over the shipped one
+automatically.
 
 In a hurry? `aria quickstart --preset tiny --minutes 5` gives you something to
 talk to almost immediately. It will not be good, but the learning machinery is
@@ -219,6 +257,40 @@ by what it learned from you.
 
 ---
 
+## Does the learning actually work?
+
+`scripts/demo_learning.py` is an experiment, not a demo. It teaches the model
+one novel fact, then tries to break it, and prints the numbers it was judged
+on. Run it yourself:
+
+```bash
+python scripts/demo_learning.py
+```
+
+Measured on the shipped checkpoint, teaching
+`"who wrote the notes in the blue folder"` → `"Priya wrote the notes in the
+blue folder last Tuesday"` over 12 passes, then learning 40 unrelated
+exchanges:
+
+| check | what it asks | result |
+| --- | --- | --- |
+| **acquisition** | does teaching lower the loss on what was taught? | 6.68 → **3.14** (53% lower) |
+| **retention** | does the lesson survive 40 unrelated new ones? | **1.79** — still far below the untaught 6.68 |
+| **stability** | is held-out English intact afterwards? | canary loss **−0.1%**, 0 rollbacks |
+| **persistence** | does it survive a restart? | a bare `GPT` loading a plain checkpoint gets **1.79** vs base **6.68** |
+
+The stability row is the one that matters. Fifty-two gradient updates went into
+the model during that run and its English did not degrade — that is the whole
+point of the six mechanisms below. The persistence row is the answer to "does
+it *really* change its own weights": after consolidation there are no adapters
+left in `learned.pt`, only ordinary weight matrices that differ from the base
+model by what it learned.
+
+Trust-region drift sat at exactly its 0.05 cap throughout, which is the bound
+doing its job rather than a coincidence.
+
+---
+
 ## Commands
 
 ```bash
@@ -289,11 +361,21 @@ modern English), cleans the markup artifacts, and builds three artifacts:
 `tokenizer.json`, packed `train.bin`/`val.bin` token streams, and `chat.pt`.
 
 `chat.pt` combines the hand-written conversation seed in
-`data/seed_dialogues.txt` (which teaches the turn protocol and a baseline
-register) with **surrogate dialogues** formed from adjacent corpus sentences.
-The surrogate pairs are not real conversations and are labelled as such in the
-code: they teach turn structure and topical continuity, nothing more. Real
-conversational competence is what the online learner is for.
+`aria/seed_dialogues.txt` with **surrogate dialogues** formed from adjacent
+corpus sentences. The surrogate pairs are not real conversations and are
+labelled as such in the code: they teach turn structure and topical continuity,
+nothing more.
+
+The seed is ~150 short exchanges, repeated (`--seed-repeat`, default 100) to
+about a quarter of the chat examples. At this model size that means the seed is
+substantially **memorised** rather than generalised — which is exactly what the
+transcripts above show, and why the conversational surface is thin the moment
+you step off it. It is a starting register, not knowledge. Retune the mix
+without re-running BPE:
+
+```bash
+aria prepare --chat-only --seed-repeat 200
+```
 
 Blocks with near-zero sentence-punctuation density are dropped before training:
 public-domain dumps tend to carry word lists, indices and code appendices that
@@ -330,6 +412,10 @@ the canary is never trained on.
   not a retrievable fact. Telling Aria your name once makes that reply more
   likely; it does not create a lookup table. Facts you need reliably belong in
   a retrieval layer, which this repo does not implement.
+- **The conversational register is memorised, not learned.** The base model
+  recalls the seed dialogues closely and has little to say beyond them. Online
+  learning changes dispositions on top of that; it does not substitute for a
+  bigger model or a real dialogue corpus.
 - **Learning from a single user is a narrow distribution.** The safeguards bound
   the drift; they do not make it neutral. Over thousands of turns Aria will
   become specifically adapted to how *you* write.

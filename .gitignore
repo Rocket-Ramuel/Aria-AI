@@ -16,6 +16,8 @@ data/meta.json
 runs/
 *.pt
 !tests/**/*.pt
+# ...except the shipped model, so a fresh clone can talk to Aria immediately
+!checkpoints/*.pt
 
 # Training run logs
 *.log
