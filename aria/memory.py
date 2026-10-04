@@ -18,6 +18,13 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+# Longer than any context window, so nothing that could be trained on is lost;
+# short enough that one enormous pasted message can't bloat replay.json.
+MAX_STORED_TURN_CHARS = 4_000
+# The journal keeps this much recent detail (plus one rotated file of the same
+# size); lifetime counts survive rotation in journal_totals.json.
+JOURNAL_MAX_BYTES = 4_000_000
+
 
 class ReplayBuffer:
     """Capacity-bounded reservoir of conversations.
@@ -43,7 +50,7 @@ class ReplayBuffer:
         if len(turns) < 2:
             return False
         item = {
-            "turns": list(turns),
+            "turns": [t[:MAX_STORED_TURN_CHARS] for t in turns],
             "weight": float(weight),
             "kind": kind,
             "t": time.time(),
@@ -95,37 +102,82 @@ class ReplayBuffer:
 
 
 class Journal:
-    """Append-only JSONL log of the learner's decisions."""
+    """Append-only JSONL log of the learner's decisions, bounded on disk.
 
-    def __init__(self, path: str | Path) -> None:
+    Every turn is logged with its text, so a journal left to grow would grow
+    forever. Instead, when it passes `max_bytes` it is rotated to
+    `journal.1.jsonl` (replacing the previous one), and the counts in the file
+    being dropped are folded into `journal_totals.json`. Disk use stays under
+    twice `max_bytes`; `summary()` still covers the learner's whole life.
+    """
+
+    _COUNTS = ("applied", "skipped", "rollbacks", "consolidations", "loss_n")
+
+    def __init__(self, path: str | Path, max_bytes: int = JOURNAL_MAX_BYTES) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_bytes
+        self.rotated = self.path.with_name(self.path.stem + ".1" + self.path.suffix)
+        self.totals_path = self.path.with_name(self.path.stem + "_totals.json")
 
     def write(self, **record: Any) -> None:
         record.setdefault("t", time.time())
         with open(self.path, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if self.path.stat().st_size > self.max_bytes:
+            self._rotate()
+
+    def _rotate(self) -> None:
+        if self.rotated.exists():
+            totals = self._totals()
+            dropped = self._count(self._rows(self.rotated))
+            for k in self._COUNTS + ("loss_sum",):
+                totals[k] = totals.get(k, 0) + dropped[k]
+            tmp = self.totals_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(totals))
+            tmp.replace(self.totals_path)
+        self.path.replace(self.rotated)
+
+    def _totals(self) -> dict[str, float]:
+        if self.totals_path.exists():
+            return json.loads(self.totals_path.read_text())
+        return {}
+
+    @staticmethod
+    def _rows(path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+    @staticmethod
+    def _count(rows: list[dict[str, Any]]) -> dict[str, float]:
+        updates = [r for r in rows if r.get("event") == "update"]
+        losses = [r["loss_after"] for r in updates if r.get("applied") and "loss_after" in r]
+        return {
+            "applied": sum(1 for r in updates if r.get("applied")),
+            "skipped": sum(1 for r in updates if not r.get("applied")),
+            "rollbacks": sum(1 for r in rows if r.get("event") == "rollback"),
+            "consolidations": sum(1 for r in rows if r.get("event") == "consolidate"),
+            "loss_n": len(losses),
+            "loss_sum": sum(losses),
+        }
 
     def read(self, limit: int | None = None) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        rows = [json.loads(line) for line in self.path.read_text().splitlines() if line]
+        """Recent records: the current file, after the rotated one."""
+        rows = self._rows(self.rotated) + self._rows(self.path)
         return rows[-limit:] if limit else rows
 
     def summary(self) -> dict[str, Any]:
-        rows = self.read()
-        applied = [r for r in rows if r.get("event") == "update" and r.get("applied")]
-        skipped = [r for r in rows if r.get("event") == "update" and not r.get("applied")]
-        rollbacks = [r for r in rows if r.get("event") == "rollback"]
-        consolidations = [r for r in rows if r.get("event") == "consolidate"]
-        losses = [r["loss_after"] for r in applied if "loss_after" in r]
+        c = self._count(self.read())
+        for k, v in self._totals().items():
+            c[k] = c.get(k, 0) + v
         return {
-            "turns_seen": len(applied) + len(skipped),
-            "updates_applied": len(applied),
-            "updates_skipped": len(skipped),
-            "rollbacks": len(rollbacks),
-            "consolidations": len(consolidations),
-            "mean_loss_after_update": sum(losses) / len(losses) if losses else None,
+            "turns_seen": int(c["applied"] + c["skipped"]),
+            "updates_applied": int(c["applied"]),
+            "updates_skipped": int(c["skipped"]),
+            "rollbacks": int(c["rollbacks"]),
+            "consolidations": int(c["consolidations"]),
+            "mean_loss_after_update": c["loss_sum"] / c["loss_n"] if c["loss_n"] else None,
         }
 
 

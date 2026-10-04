@@ -115,7 +115,7 @@ class LearnerConfig:
     document_passes: int = 3       # epochs over an uploaded document
     document_batch: int = 4        # document windows per gradient step
     document_min_steps: int = 24   # a short sample still gets a real lesson
-    document_max_steps: int = 400  # cap per upload, so a book doesn't take all night
+    document_max_steps: int = 0    # 0 = no limit: every pass over every page
     # An upload is deliberate material, so it moves faster than chat. Measured
     # on the shipped model: 3x cuts loss on a 200-word sample from 6.4 to about 4
     # with the canary unchanged; 10x starts to cost general English.
@@ -219,7 +219,6 @@ def blank_learner_config() -> LearnerConfig:
         document_passes=4,
         document_batch=8,
         document_lr_scale=1.0,
-        document_max_steps=600,
         ewc_lambda=0.0,
         l2_anchor=0.0,
         trust_radius=0.0,

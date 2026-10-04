@@ -290,6 +290,27 @@ def lora_parameters(model: nn.Module) -> list[nn.Parameter]:
 
 
 @torch.no_grad()
+def merged_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """The state dict `merge_lora` would produce, without modifying the model
+    or copying it: adapters are folded into their base weights on the fly and
+    the keys come out as a plain `GPT` expects them."""
+    lora = {name: m for name, m in model.named_modules() if isinstance(m, LoRALinear)}
+    out: dict[str, torch.Tensor] = {}
+    for key, value in model.state_dict().items():
+        owner = next((n for n in lora if key.startswith(n + ".")), None)
+        if owner is None:
+            out[key] = value
+            continue
+        rest = key[len(owner) + 1:]
+        if rest == "base.weight":
+            out[f"{owner}.weight"] = lora[owner].merged_weight()
+        elif rest.startswith("base."):
+            out[f"{owner}.{rest[5:]}"] = value
+        # lora_A / lora_B are folded into the weight above.
+    return out
+
+
+@torch.no_grad()
 def merge_lora(model: nn.Module) -> int:
     """Fold every adapter back into its base weight and remove the wrapper.
 

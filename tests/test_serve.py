@@ -15,7 +15,7 @@ import pytest
 from aria.chat import ChatSession
 from aria.data import prepare
 from aria.cli import main
-from aria.serve import PAGE, _Handler
+from aria.serve import PAGE, App, FairLock, make_handler
 from http.server import ThreadingHTTPServer
 
 CORPUS = """The river ran past the old mill and turned east towards the sea.
@@ -43,9 +43,8 @@ def server(tmp_path_factory):
 
     session = ChatSession(checkpoint=out / "base.pt", state_dir=root / "online",
                           data_dir=data, max_new_tokens=8)
-    handler = type("H", (_Handler,), {"session": session,
-                                      "lock": threading.Lock()})
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    app = App.for_session(session)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     yield base, session
@@ -238,43 +237,197 @@ def test_malformed_json_is_a_400_not_a_crash(server):
 
 
 # --- uploads -------------------------------------------------------------
+#
+# A document is sent raw (application/octet-stream), lands on disk, and is
+# learned by a background job; the page polls /api/jobs for progress.
 
 
-def upload(base, name, data, **extra):
-    import base64
-    return post(base, "/api/upload",
-                {"name": name, "data": base64.b64encode(data).decode(), **extra})
+def upload(base, name, data, **query):
+    from urllib.parse import urlencode
+    req = urllib.request.Request(
+        f"{base}/api/upload?{urlencode(dict(name=name, **query))}", data=data,
+        headers={"Content-Type": "application/octet-stream"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
 
 
-def test_upload_streams_progress_then_a_summary(server):
+def wait_for(base, job_id, timeout=120):
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        jobs = {j["id"]: j for j in json.loads(get(base, "/api/jobs")[1])["jobs"]}
+        if jobs[job_id]["state"] not in ("queued", "running"):
+            return jobs[job_id]
+        time.sleep(0.1)
+    raise AssertionError("job did not finish")
+
+
+def test_upload_learns_in_the_background(server):
     base, session = server
     before = session.learner.updates_applied
     status, body = upload(base, "sample.txt", (CORPUS * 3).encode(), passes=1)
-    assert status == 200
-    events = sse_events(body)
-    assert any("progress" in e for e in events)
-    assert "learned sample.txt" in events[-1]["done"]
+    assert status == 200 and body["job"]["state"] in ("queued", "running")
+    job = wait_for(base, body["job"]["id"])
+    assert job["state"] == "done", job
+    assert "learned sample.txt" in job["summary"]
+    assert job["total"] >= 1 and job["step"] == job["total"]
     assert session.learner.updates_applied > before
+    # The uploaded copy is deleted once learned.
+    assert not list((session.state_dir / "uploads").glob("*"))
 
 
 def test_upload_of_a_transcript_as_a_speaker(server):
     base, _ = server
     log = b"Sam: are you coming tonight\nJo: reckon I will, love\n" * 3
     _, body = upload(base, "chat.txt", log, speaker="Jo", passes=1)
-    assert "replies by Jo" in sse_events(body)[-1]["done"]
+    assert "replies by Jo" in wait_for(base, body["job"]["id"])["summary"]
     _, body = upload(base, "chat.txt", log, speaker="Nobody", passes=1)
-    assert "speakers are" in sse_events(body)[-1]["error"]
+    job = wait_for(base, body["job"]["id"])
+    assert job["state"] == "failed" and "speakers are" in job["error"]
+
+
+def test_inspect_finds_the_speakers_of_a_transcript(server):
+    base, _ = server
+    req = urllib.request.Request(
+        base + "/api/inspect?name=chat.txt", method="POST",
+        data=b"Sam: hi\nJo: hiya\nSam: you well\nJo: not bad\nJo: you?\n",
+        headers={"Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        assert json.loads(r.read())["speakers"] == ["Jo", "Sam"]
+    req = urllib.request.Request(
+        base + "/api/inspect?name=essay.txt", method="POST",
+        data=b"An essay. It has no speakers at all.\n",
+        headers={"Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        assert json.loads(r.read())["speakers"] is None
+
+
+def test_a_running_upload_can_be_stopped(server):
+    base, session = server
+    status, body = upload(base, "long.txt", (CORPUS * 40).encode(), passes=50)
+    job_id = body["job"]["id"]
+    _, out = post(base, f"/api/jobs/{job_id}/cancel", {})
+    assert json.loads(out)["ok"]
+    job = wait_for(base, job_id)
+    assert job["state"] == "stopped"
+    assert job["step"] < job["total"] or job["total"] == 0
+
+
+def test_chat_is_not_blocked_by_a_long_upload(server):
+    """The point of learning in the background: a message waits for one
+    gradient step, not for the whole document."""
+    import time
+    base, _ = server
+    _, body = upload(base, "long.txt", (CORPUS * 40).encode(), passes=50)
+    job_id = body["job"]["id"]
+    deadline = time.time() + 60
+    while json.loads(get(base, "/api/jobs")[1])["jobs"][-1]["phase"] != "learning":
+        assert time.time() < deadline
+        time.sleep(0.05)
+    t0 = time.time()
+    status, reply = post(base, "/api/chat", {"message": "hello while you read"})
+    elapsed = time.time() - t0
+    still = {j["id"]: j for j in json.loads(get(base, "/api/jobs")[1])["jobs"]}[job_id]
+    post(base, f"/api/jobs/{job_id}/cancel", {})
+    wait_for(base, job_id)
+    assert status == 200 and "learn" in sse_events(reply)[-1]
+    assert still["state"] == "running", "chat only answered after the upload finished"
+    assert elapsed < 30
 
 
 def test_bad_uploads_are_rejected_cleanly(server):
     base, _ = server
+    code, body = upload(base, "song.mp3", b"\x00\x01\x02")
+    assert code == 415 and "can't read" in body["error"]
+    code, body = upload(base, "x.txt", b"hello", passes="0")
+    assert code == 400
+    req = urllib.request.Request(base + "/api/upload?name=x.txt", data=b"hello",
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
     with pytest.raises(urllib.error.HTTPError) as e:
-        post(base, "/api/upload", {"name": "x.txt", "data": "not base64!!"})
-    assert e.value.code == 400
-    _, body = upload(base, "song.mp3", b"\x00\x01\x02")
-    assert "can't read" in sse_events(body)[-1]["error"]
+        urllib.request.urlopen(req, timeout=30)
+    assert e.value.code == 415
     assert get(base, "/api/status")[0] == 200
+
+
+def test_upload_from_another_site_is_refused(server):
+    base, _ = server
+    req = urllib.request.Request(base + "/api/upload?name=x.txt", data=b"inject",
+                                 headers={"Content-Type": "application/octet-stream",
+                                          "Origin": "https://evil.example"},
+                                 method="POST")
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=30)
+    assert e.value.code == 403
+
+
+def test_upload_command_points_to_the_paperclip(server):
+    base, _ = server
+    _, body = post(base, "/api/command", {"command": "/upload /etc/hosts"})
+    assert "paperclip" in json.loads(body)["output"]
 
 
 def test_page_offers_a_file_upload():
     assert 'type="file"' in PAGE and ".docx" in PAGE and "/api/upload" in PAGE
+    assert 'id="attach"' in PAGE          # next to the message box, not hidden away
+
+
+def test_fair_lock_serves_in_arrival_order():
+    import time
+    lock, order = FairLock(), []
+    lock.acquire()
+
+    def worker(i):
+        lock.acquire()
+        order.append(i)
+        lock.release()
+
+    threads = []
+    for i in range(5):
+        t = threading.Thread(target=worker, args=(i,))
+        t.start()
+        threads.append(t)
+        time.sleep(0.05)          # make arrival order unambiguous
+    lock.release()
+    for t in threads:
+        t.join(5)
+    assert order == [0, 1, 2, 3, 4]
+
+
+def test_switching_models_keeps_separate_memories(server, tmp_path):
+    """Pretrained and blank sit side by side; each has its own memory."""
+    from aria.pretrain import create_blank_checkpoint
+    _, session = server
+    blank = create_blank_checkpoint(tmp_path / "blank" / "base.pt", size="tiny",
+                                    block_size=64)
+    app = App({"pretrained": {"label": "Pretrained"},
+               "blank": {"label": "Blank", "checkpoint": blank}},
+              "pretrained", {"max_new_tokens": 4}, sessions={"pretrained": session})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        st = json.loads(get(base, "/api/status")[1])
+        assert st["model"] == "pretrained"
+        assert [m["key"] for m in st["models"]] == ["pretrained", "blank"]
+        assert not st["models"][1]["loaded"]            # loaded on first use
+
+        _, body = post(base, "/api/model", {"model": "blank"})
+        st = json.loads(body)
+        assert st["model"] == "blank" and st["plasticity"] == "full"
+        _, reply = post(base, "/api/chat", {"message": "hello blank"})
+        assert "learn" in sse_events(reply)[-1]
+        assert app.sessions["blank"].history and \
+            app.sessions["blank"].state_dir != session.state_dir
+
+        with pytest.raises(urllib.error.HTTPError) as e:
+            post(base, "/api/model", {"model": "nope"})
+        assert e.value.code == 400
+        post(base, "/api/model", {"model": "pretrained"})
+        assert json.loads(get(base, "/api/status")[1])["model"] == "pretrained"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

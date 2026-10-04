@@ -13,11 +13,17 @@ Two halves:
    conversational turn and writes the result back into the model's own weights,
    with the machinery required to make that survivable rather than destructive.
 
-You can also hand it **documents** — a writing sample, a chat log, the
-transcript of someone talking — and it will learn to sound like them, and, for
-a transcript, to answer the way a chosen person answers. And if you want
-nothing between it and the people it learns from, you can start it **blank**:
-no pretraining, no vocabulary, no grammar, only what you give it.
+You can also give it **documents**, right in the chat: press the paperclip,
+pick a book, a pile of letters, a chat log or a speech transcript — any size —
+and Aria reads it and learns its grammar, words and voice in the background
+while you keep talking to her. For a transcript she can learn to answer the way
+one chosen person answers. And if you want nothing between her and the people
+she learns from, you can start her **blank**: no pretraining, no vocabulary, no
+grammar, only what you give her.
+
+However much she learns, she doesn't get bigger: learning changes the values of
+her weights, never their number. The shipped model is a 20 MB file and stays
+that size. [Details below](#how-big-does-aria-get).
 
 The online learning is the interesting part. Doing continual learning *naively* —
 one SGD step per turn on whatever the user just typed — reliably destroys a
@@ -81,7 +87,9 @@ It runs on your own machine, on the CPU, for free. No API key, no account, no
 service to sign up for, and nothing is sent anywhere — the only network access
 in the whole project is `prepare` downloading the public-domain corpus once.
 
-**Requirements:** Python 3.10+ and about 2 GB of RAM. Any laptop from the last
+**Requirements:** Python 3.10+ and about 1.5 GB of free RAM (measured peak:
+0.85 GB for the pretrained model, 1.05 GB for a blank one, most of it PyTorch
+itself). Any laptop from the last
 decade will do. macOS, Linux and Windows all work; a GPU is optional.
 
 ### Talk to her straight away
@@ -97,7 +105,7 @@ pip install -e .
 aria serve      # browser UI, or `aria chat --verbose` for the terminal
 ```
 
-`checkpoints/aria-small.pt` (30 MB) is the 6.5M-parameter model described
+`checkpoints/aria-small.pt` (20 MB) is the 6.5M-parameter model described
 above, stored in half precision and loaded back into a float32 model. It
 carries its own tokenizer and Fisher information, so nothing else is needed.
 
@@ -135,6 +143,12 @@ file served by Python's standard library — no framework, no build step, no CDN
 so it works with the network cable unplugged. Replies stream token by token,
 and each turn shows what the learner decided.
 
+The **paperclip** beside the message box (or dropping a file anywhere on the
+page) gives her a document to read; see [below](#teaching-it-from-documents).
+The menu at the top switches between the **pretrained** model and a **blank**
+one; each keeps its own memory, and the blank one is created the first time you
+pick it.
+
 It binds to localhost. Anything typed into that page gets written into the
 model's weights and to disk, so don't put it on a public interface.
 
@@ -166,7 +180,8 @@ talking to Aria needs no GPU, only training benefits from one.
 
 On four CPU cores, the `small` preset runs about 70 training steps per minute,
 and a chat reply takes a second or two. Each turn's learning update costs about
-as much as one more reply. It is comfortably interactive.
+as much as one more reply. It is comfortably interactive. Reading documents
+is slower — see [how long](#how-long-it-takes).
 
 Everything the learner accumulates lives in an `online/` directory next to the
 checkpoint it is learning on top of — `checkpoints/online/` for the shipped
@@ -176,9 +191,9 @@ and journal contain your conversations in plain text.)
 
 | file | contents |
 | --- | --- |
-| `learned.pt` | the weights, with all learning merged in — a plain checkpoint |
-| `replay.json` | remembered exchanges, as readable text |
-| `journal.jsonl` | every decision: what was learned, skipped, or rolled back |
+| `learned.pt` | the weights, with all learning merged in — a plain checkpoint, half precision |
+| `replay.json` | remembered exchanges, as readable text (at most 4,096) |
+| `journal.jsonl` | every decision: what was learned, skipped, or rolled back (rotates at 4 MB) |
 | `learner_state.json` | learning rate, surprise baseline, canary baseline |
 
 Delete that directory to reset Aria to her post-pretraining state. The base
@@ -187,13 +202,19 @@ and `serve` write to.
 
 ---
 
-## Teaching it a voice
+## Teaching it from documents
 
-### Upload a document
+### Upload a document, then keep talking
 
-In the browser, open **Teach from a file** under the message box (or drop a
-file anywhere on the page). In the terminal, `/upload path/to/file`. In bulk,
-`aria teach file1.txt file2.docx ...`.
+In the browser, press the **paperclip** next to the message box, or drop files
+anywhere on the page. A card appears in the conversation showing her progress;
+you can go on chatting while she reads, and a message waits for at most one
+learning step (a fraction of a second), not for the document. **Stop** on the
+card ends it early and keeps everything learned so far.
+
+In the terminal, `/upload path/to/file` — or just drag the file into the
+terminal window, which pastes its path. Ctrl-C stops early and keeps what she
+learned. For many files at once, `aria teach a.txt b.docx c.srt`.
 
 Readable formats: `.txt`, `.md`, `.docx`, `.srt`/`.vtt` subtitles (timings
 and cue numbers are stripped, leaving what was said), and `.pdf` if you
@@ -201,66 +222,151 @@ and cue numbers are stripped, leaving what was said), and `.pdf` if you
 speech-recognition model, which this project doesn't include. Transcribe the
 recording first and upload the transcript.
 
-What happens to the text depends on what it is:
+### What she learns from it
 
-- **Prose** — an essay, letters, a diary — is cut into context-sized windows
-  and learned *as if Aria had written it*. It is also cut into a run of
-  exchanges, each sentence answering the one before, so the voice is learned as
-  a way of *replying*, not only of continuing text.
+- **Prose** — a book, letters, a diary — is learned *as if Aria had written
+  it*: cut into context-sized windows, which teach the grammar, vocabulary and
+  rhythm of continuous text; and into a run of exchanges, each sentence
+  answering the one before, so the same language is learned as a way of
+  *replying*. For a model with no pretraining, the second is the difference
+  between memorising a sample and answering in its style.
 - **A transcript or chat log** — lines like `Sam: are you coming tonight?` —
-  becomes conversations when you name a speaker (`as Jo` in the terminal, the
-  name box in the browser, `--speaker Jo` for `teach`). Jo's lines become
-  Aria's side and everyone else's become the prompts, so she learns how Jo
-  *answers*. Without a name, the labels are stripped and it is learned as prose.
+  is noticed before it is sent, and the page asks whose way of talking to
+  learn (the terminal asks too; `teach` takes `--speaker Jo`). Jo's lines
+  become Aria's side and everyone else's become the prompts, so she learns how
+  Jo *answers*. Choose nobody and the labels are stripped and it is learned as
+  prose.
 
-An upload takes several passes over the material (default 3, at least 24 steps,
-at most 400) at three times the chat learning rate, with rehearsal mixed in and
-every safeguard below still running. On the shipped model, a 200-word sample
-drops from loss 6.4 to 3.8 in about 6 seconds with held-out English unchanged.
-A sample of each upload is kept in the replay buffer, so later conversations
-keep rehearsing it.
+### No limits on size
+
+There is no cap on the size of a document or on how long she learns from it.
+Every pass covers every page. Files are streamed from disk and never held in
+memory whole: reading a 30 MB document used no more memory than a 1 MB one
+(measured, [below](#how-big-does-aria-get)). Long uploads are saved every five
+minutes, so closing the laptop costs minutes, not hours.
+
+Each upload takes three passes by default (four for a blank model), and at
+least 24 steps for very short ones, at three times the chat learning rate,
+with rehearsal of earlier lessons mixed in and every safeguard below still
+running. The canary may roll back a stretch that hurt her general English; the
+upload then carries on more gently, and stops only if that happens three times.
+
+### Is she learning the language, or memorising?
+
+One sentence-group in every twenty is held back and never trained on. The
+progress card reports loss on that **held-out** text: if it falls, she is
+learning the language of the document — grammar, word order, vocabulary — and
+not just remembering its sentences. (Documents shorter than about 160
+sentences are too small to hold any back; their card says plain "loss".)
+
+### How long it takes
+
+Measured on four CPU cores:
+
+| model | reads, per pass | a 100,000-word book |
+| --- | --- | --- |
+| pretrained | ~770 words/s | ~7 min (3 passes) |
+| blank | ~450 words/s | ~15 min (4 passes) |
+
+A 5-million-word archive is an overnight job on a laptop. It runs in the
+background and can be stopped any time; a GPU (`--device cuda`) is much
+faster.
 
 ### Your own messages
 
 By default Aria also learns from what *you* type, framed as something she
 said (`--learner-style-mirror false` turns it off). Over a conversation that
 pulls her phrasing toward yours. Her own replies are learned too, at the same
-time; the blank model below skips those, since rehearsing her own babble would
-teach her nothing.
+time; the blank model skips those, since rehearsing her own babble would teach
+her nothing.
 
 ### Start blank: no pretraining at all
+
+Pick **Blank** in the menu at the top of the page, or:
 
 ```bash
 aria serve --blank        # or: aria chat --blank, aria teach --blank sample.txt
 ```
 
-`--blank` uses `runs/blank/base.pt`, creating it if needed (`aria blank` makes
-one explicitly, `--size tiny|small|base`). It is a model with random weights
-and a byte-level tokenizer with no learned vocabulary: it assumes nothing
-about English, spelling or grammar. Everything it ever produces it learned
-from what you uploaded and said, so its voice can only be the voice of its
+That uses `runs/blank/base.pt`, creating it if needed (`aria blank` makes one
+explicitly, `--size tiny|small|base`). It is a model with random weights and a
+byte-level tokenizer with no learned vocabulary: it assumes nothing about
+English, spelling or grammar. Everything it ever produces it learned from what
+you uploaded and said, so its grammar and its voice can only be those of its
 sources.
 
 It runs with different learner settings, stored in its checkpoint: full
 plasticity, a 10× higher learning rate, and none of the anchors, trust region,
 EWC or canary. Those exist to protect knowledge a model already has, and a
-blank model has none to protect.
+blank model has none to protect. Skipping them also saves two full copies of
+the network in memory.
 
-**Expect it to be slow to talk.** Measured on a CPU, uploading a 1,700-word
-writing sample:
+**Expect it to be slow to talk.** Measured on a CPU, uploading the same
+1,700-word writing sample repeatedly:
 
-| after | loss | a reply to "what do you like?" |
+| after | held-out loss, per byte | replies to "what do you like?" |
 | --- | --- | --- |
-| 32 steps (~20 s) | 2.7 | `endrog s weios,at,lllr. noanthate a maudiorep.` |
-| 190 steps (~2 min) | 1.0 | `I have on pay.` |
-| 580 steps (~6 min) | 0.14 | `Thart made cors on before conversations, I do not have a uext I will day ow.` |
+| 31 steps (~6 s) | 2.61 (from 5.61) | `nd t ws w.` |
+| 186 steps (~1.5 min) | 1.38 | `I word foremeter wonversiate, I spetteding ow.` |
+| 1,116 steps (~10 min) | 1.13 | `What would you like me to say not?` · `Wand I will rme.` · `Yod corrections.` |
+
+The loss is measured on sentences of the sample she never trained on, so its
+fall is the language being learned, not the sample being memorised.
 
 It finds letters, then words, then the shape of a sentence in the source's
 style — but 1,700 words is far too little to learn a language from, and it
-mostly recombines what it read. Give it tens of thousands of words of one
-person's writing or transcribed speech and run several uploads; it will stay a
-mimic, not a conversationalist. If you want sensible replies *in* someone's
-voice, the pretrained model plus uploads gets you there much sooner.
+mostly recombines what it read. Grammar needs volume: give it hundreds of
+thousands of words — a few books' worth of one person's writing or transcribed
+speech — and it has something to generalise from. If you want sensible replies
+*in* someone's voice soon, the pretrained model plus uploads gets you there
+much faster.
+
+---
+
+## How big does Aria get?
+
+**The same size forever.** A neural network's size is fixed by its shape —
+how many layers, how wide — not by how much it has learned. Learning changes
+the values of the weights; it never adds any. An Aria that has read a hundred
+books is exactly as large as a fresh one.
+
+Measured:
+
+| | on disk | peak RAM |
+| --- | --- | --- |
+| shipped model (`checkpoints/aria-small.pt`) | 19.7 MB | — |
+| learned weights, pretrained (`learned.pt`) | 13.1 MB, after any amount of learning | 0.85 GB |
+| learned weights, blank (`learned.pt`) | 9.0 MB, after any amount of learning | 1.05 GB |
+| reading a 1 MB document | — | same as above |
+| reading a 30 MB document | — | same as above |
+
+About 0.5 GB of the RAM is PyTorch itself, and 0.15 GB more is PyTorch's
+optimiser machinery, loaded once. Aria's own share is around 0.1 GB.
+
+What keeps it small (`aria/storage.py`):
+
+- weights are stored in **half precision** and loaded back into a full-precision
+  model — half the size, with outputs that differ by less than sampling noise;
+- the input embedding and output layer are **one shared matrix**, stored once;
+- the Fisher information takes **one byte per weight** on a log scale. (It used
+  to be float16, which rounded 11% of the shipped model's values to zero;
+  `scripts/recompute_fisher.py` re-estimated it, and the shipped file shrank
+  from 30 MB to 20 MB with identical outputs);
+- every save is **atomic**, so a crash mid-save never corrupts what was learned;
+- nothing else grows without bound: the replay buffer keeps at most 4,096
+  exchanges, the journal rotates at 4 MB while keeping lifetime totals, and an
+  uploaded file is deleted once learned.
+
+`aria status` and the page header show how much disk her memory uses. To carry
+everything she has learned as one file: `aria export --with-learning --out
+my-aria.pt` (13 MB for the small model).
+
+**The other side of a fixed size is a fixed capacity.** A 6.5M-parameter
+network can only hold so much; past some point, new learning overwrites old,
+which rehearsal slows but cannot stop. If you plan to feed her a library, start
+from a larger shape — `aria blank --size base` is ~100M parameters, about
+200 MB on disk and a few GB of RAM, and wants a GPU for learning at a
+reasonable speed.
 
 ---
 
@@ -362,7 +468,7 @@ by what it learned from you.
 
 `scripts/demo_learning.py` is an experiment, not a demo. It teaches the model
 one novel fact, then tries to break it, and prints the numbers it was judged
-on. Run it yourself:
+on. Run it yourself (it uses the shipped model, or one you trained):
 
 ```bash
 python scripts/demo_learning.py
@@ -375,14 +481,16 @@ exchanges:
 
 | check | what it asks | result |
 | --- | --- | --- |
-| **acquisition** | does teaching lower the loss on what was taught? | 6.68 → **3.14** (53% lower) |
-| **retention** | does the lesson survive 40 unrelated new ones? | **1.79** — still far below the untaught 6.68 |
-| **stability** | is held-out English intact afterwards? | canary loss **−0.1%**, 0 rollbacks |
-| **persistence** | does it survive a restart? | a bare `GPT` loading a plain checkpoint gets **1.79** vs base **6.68** |
+| **acquisition** | does teaching lower the loss on what was taught? | 6.68 → **2.53** (62% lower) |
+| **retention** | does the lesson survive 40 unrelated new ones? | **0.82–0.84** — far below the untaught 6.68 |
+| **stability** | is held-out English intact afterwards? | canary loss **+0.7% to +1.8%** across runs (tolerance 6%), 0 rollbacks |
+| **persistence** | does it survive a restart? | a bare `GPT` loading the half-precision `learned.pt` gets **0.82**, the same as before saving, vs base **6.68** |
 
 The stability row is the one that matters. Fifty-two gradient updates went into
-the model during that run and its English did not degrade — that is the whole
-point of the six mechanisms below. The persistence row is the answer to "does
+the model during that run and its English barely moved — that is the whole
+point of the six mechanisms below. (The lesson's loss keeps falling during
+the 40 unrelated updates because it sits in the replay buffer and is
+rehearsed alongside them — rehearsal doing its job.) The persistence row is the answer to "does
 it *really* change its own weights": after consolidation there are no adapters
 left in `learned.pt`, only ordinary weight matrices that differ from the base
 model by what it learned.
@@ -403,9 +511,10 @@ aria chat [--verbose] [--no-learn] [--learner-plasticity full]
 aria sample --prompt "The " --state-dir runs/aria/online
 aria serve --blank            # a model with no pretraining (see above)
 aria blank [--size small]     # create one explicitly
-aria teach notes.txt more.docx         # learn from documents
+aria teach notes.txt more.docx         # learn from documents, any size
 aria teach chat.txt --speaker Jo       # learn to answer like Jo
-aria status                   # what the learner has been doing
+aria status [--blank]         # what the learner has been doing
+aria export --with-learning --out my-aria.pt   # everything she knows, one file
 ```
 
 Inside `chat`:
@@ -414,7 +523,8 @@ Inside `chat`:
 /status        learner and memory statistics
 /memory [n]    recent remembered exchanges
 /teach <text>  learn from a passage directly
-/upload <file> [as <name>]   learn from a whole document or transcript
+/upload <file> [as <name>]   read a document or transcript and learn from it
+                             (or drag the file into the terminal)
 /correct <text>  replace Aria's last reply with yours and learn from it (weight 3x, bypasses the gate)
 /consolidate   force a consolidation pass
 /learn on|off  toggle online learning
@@ -548,14 +658,16 @@ aria/
   data.py        corpus prep, chat formatting, batching
   pretrain.py    offline training loop + Fisher estimation
   learner.py     the online learning engine
-  memory.py      replay buffer and decision journal
-  documents.py   reading uploads: txt/md/docx/srt/vtt/pdf, transcripts
+  memory.py      replay buffer and decision journal (bounded)
+  documents.py   streaming readers for uploads: txt/md/docx/srt/vtt/pdf, transcripts
+  storage.py     compact, atomic weight files
   sample.py      generation
   chat.py        REPL
-  serve.py       local browser UI (standard library only)
+  serve.py       local browser UI and background learning (standard library only)
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
-tests/           151 tests
+tests/           179 tests
 notebooks/       Colab notebook for a free GPU
-scripts/demo_learning.py  measures whether the learning actually works
+scripts/demo_learning.py     measures whether the learning actually works
+scripts/recompute_fisher.py  re-estimates a checkpoint's Fisher information
 ```

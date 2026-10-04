@@ -70,7 +70,11 @@ def test_a_document_covers_all_of_the_text(model, tok, tmp_path):
     covered = set()
     for x, _ in windows:
         covered.update(t for t in x if t >= tok.n_special)
-    assert covered == {t for t in tok.encode(VOICE.strip()) if t >= tok.n_special}
+    # Documents are encoded sentence by sentence, the way chat turns are.
+    from aria.documents import iter_units
+    expected = {t for u in iter_units(VOICE.splitlines())
+                for t in tok.encode(" " + u) if t >= tok.n_special}
+    assert covered == expected
     for x, y in windows:
         assert len(x) <= model.cfg.block_size
         assert x[:2] == [tok.bos_id, tok.aria_id]
@@ -96,13 +100,18 @@ def test_document_steps_cannot_skip_a_consolidation(model, tok, tmp_path):
                for r in learner.journal.read())
 
 
-def test_document_learning_stops_when_rolled_back(model, tok, tmp_path):
+def test_document_learning_stops_after_repeated_rollbacks(model, tok, tmp_path):
+    """One rollback slows an upload down; three in a row mean the material
+    itself is hurting her English, and the upload stops."""
+    from aria.learner import MAX_ROLLBACKS_PER_UPLOAD
     learner = make_learner(model, tok, tmp_path, health_interval=1,
                            health_patience=1, document_batch=1)
     learner.canary_baseline = 1e-6                        # every check fails
+    lr_before = learner.lr
     report = learner.learn_document(VOICE, passes=5)
     assert report.rolled_back
-    assert report.steps == 1
+    assert report.steps == MAX_ROLLBACKS_PER_UPLOAD
+    assert learner.lr < lr_before
 
 
 def test_learning_a_transcript_teaches_that_persons_replies(model, tok, tmp_path):
@@ -158,11 +167,15 @@ def test_corrections_are_learned_even_without_own_replies(model, tok, tmp_path):
 
 
 def test_zero_trust_radius_disables_the_projection(model, tok, tmp_path):
+    before = {n: p.detach().clone() for n, p in model.named_parameters()}
     learner = make_learner(model, tok, tmp_path, plasticity="full", trust_radius=0.0,
                            learning_rate=0.05, ewc_lambda=0.0, l2_anchor=0.0)
     for _ in range(5):
         r = learner.observe(["teach me", "a fact worth remembering"])
-    assert r.drift > 0.05
+    assert r.drift is None                     # nothing anchors the weights
+    moved = max(float((p.detach() - before[n]).norm() / before[n].norm())
+                for n, p in model.named_parameters())
+    assert moved > 0.05
 
 
 # --- a model with no pretraining -------------------------------------------

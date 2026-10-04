@@ -12,7 +12,7 @@ the numbers it was judged on:
 
 Run after `prepare` and `pretrain`:
 
-    python scripts/demo_learning.py --checkpoint runs/aria/base.pt
+    python scripts/demo_learning.py            # the shipped model, or one you trained
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from aria.config import LearnerConfig
 from aria.data import TokenStream, encode_dialogue
 from aria.learner import OnlineLearner, resume_learned_weights
 from aria.model import GPT
-from aria.pretrain import load_checkpoint
+from aria.pretrain import load_checkpoint, resolve_checkpoint
 
 LESSON = [
     "who wrote the notes in the blue folder",
@@ -67,7 +67,8 @@ def build(checkpoint: Path, state_dir: Path, data_dir: Path, plasticity: str,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default="runs/aria/base.pt")
+    ap.add_argument("--checkpoint", default=None,
+                    help="defaults to runs/aria/base.pt, then checkpoints/aria-small.pt")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--state-dir", default="runs/demo_online")
     ap.add_argument("--plasticity", default="lora",
@@ -85,9 +86,10 @@ def main() -> int:
     if state_dir.exists() and not args.keep_state:
         shutil.rmtree(state_dir)
 
-    checkpoint = Path(args.checkpoint)
-    if not checkpoint.exists():
-        print(f"no checkpoint at {checkpoint}; run `python -m aria pretrain` first")
+    try:
+        checkpoint = resolve_checkpoint(args.checkpoint)
+    except FileNotFoundError as e:
+        print(e)
         return 1
 
     data_dir = Path(args.data_dir)

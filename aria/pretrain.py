@@ -19,6 +19,7 @@ import torch
 from .config import AriaConfig, ModelConfig, TrainConfig, blank_learner_config, preset
 from .data import ChatSet, TokenStream, mixed_batch
 from .model import GPT
+from .storage import atomic_save, decode_fisher, encode_fisher, half_state_dict
 from .tokenizer import BPETokenizer
 
 
@@ -134,6 +135,9 @@ def load_checkpoint(path: str | Path, device: str = "cpu"):
     cfg = AriaConfig.from_dict(ckpt["config"])
     tok = BPETokenizer(merges=[tuple(m) for m in ckpt["tokenizer"]["merges"]],
                        specials=ckpt["tokenizer"]["specials"])
+    # However the Fisher was stored (float32, float16, 8-bit log codes),
+    # callers get float32.
+    ckpt["fisher"] = decode_fisher(ckpt.get("fisher"))
     model = GPT(cfg.model).to(device)
     # load_state_dict casts on copy, so a half-precision export loads straight
     # into the float32 model without any special handling here.
@@ -162,30 +166,36 @@ def resolve_checkpoint(path: str | Path | None) -> Path:
 
 
 def export_checkpoint(src: str | Path, dst: str | Path, half: bool = True,
-                      keep_fisher: bool = True) -> dict:
+                      keep_fisher: bool = True,
+                      learned: str | Path | None = None) -> dict:
     """Write a compact, shareable copy of a checkpoint.
 
     Half precision halves the file for no measurable quality cost at this size
-    (the weights are loaded back into a float32 model), which is the difference
-    between a checkpoint that is reasonable to commit and one that is not.
+    (the weights are loaded back into a float32 model); the tied embedding is
+    stored once; the Fisher information takes one byte per weight (see
+    `aria.storage`). Together that is the difference between a checkpoint that
+    is reasonable to commit and one that is not.
+
+    With `learned` (a `learned.pt`), the weights are the ones Aria has learned
+    since, so everything she knows travels as one self-contained file.
     """
     ckpt = torch.load(src, map_location="cpu", weights_only=True)
-
-    def cast(d):
-        return {k: (v.half() if half and v.is_floating_point() else v)
-                for k, v in d.items()}
+    weights = ckpt["model"]
+    if learned is not None:
+        weights = torch.load(learned, map_location="cpu", weights_only=True)["model"]
+    fisher = decode_fisher(ckpt.get("fisher")) if keep_fisher else None
 
     out = {
-        "model": cast(ckpt["model"]),
+        "model": half_state_dict(weights) if half else
+                 {k: v.float() if v.is_floating_point() else v for k, v in weights.items()},
         "config": ckpt["config"],
         "tokenizer": ckpt["tokenizer"],
         "step": ckpt.get("step"),
         "val_loss": ckpt.get("val_loss"),
-        "fisher": cast(ckpt["fisher"]) if (keep_fisher and ckpt.get("fisher")) else None,
+        "fisher": (encode_fisher(fisher) if half else fisher) if fisher else None,
     }
     dst = Path(dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(out, dst)
+    atomic_save(out, dst)
     return {
         "source_mb": Path(src).stat().st_size / 1e6,
         "export_mb": dst.stat().st_size / 1e6,
@@ -356,5 +366,13 @@ def create_blank_checkpoint(path: str | Path = BLANK_CHECKPOINT,
     model_cfg.block_size = block_size
     cfg = AriaConfig(model=model_cfg, learner=blank_learner_config())
     torch.manual_seed(seed)
-    save_checkpoint(path, GPT(model_cfg), cfg, tok, step=0, val_loss=float("nan"))
+    model = GPT(model_cfg)
+    atomic_save({
+        "model": half_state_dict(model.state_dict()),
+        "config": cfg.to_dict(),
+        "tokenizer": {"specials": tok.specials, "merges": tok.merges},
+        "step": 0,
+        "val_loss": float("nan"),
+        "fisher": None,
+    }, path)
     return path

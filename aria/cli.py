@@ -154,10 +154,17 @@ def _cmd_quickstart(args) -> int:
 
 
 def _cmd_export(args) -> int:
-    from .pretrain import export_checkpoint, resolve_checkpoint
-    info = export_checkpoint(resolve_checkpoint(args.checkpoint), args.out,
+    from .pretrain import export_checkpoint
+    checkpoint = _checkpoint_for(args)
+    learned = None
+    if args.state_dir or args.with_learning:
+        learned = _state_dir_for(args) / "learned.pt"
+        if not learned.exists():
+            print(f"nothing learned yet: no {learned}")
+            return 1
+    info = export_checkpoint(checkpoint, args.out,
                              half=not args.full_precision,
-                             keep_fisher=not args.no_fisher)
+                             keep_fisher=not args.no_fisher, learned=learned)
     print(f"wrote {args.out}")
     print(f"  {info['source_mb']:.1f} MB -> {info['export_mb']:.1f} MB"
           f"  (half={info['half']}, fisher={info['fisher']})")
@@ -182,16 +189,20 @@ def _cmd_sample(args) -> int:
     return 0
 
 
+def _checkpoint_for(args) -> Path:
+    from .pretrain import BLANK_CHECKPOINT, resolve_checkpoint
+    if getattr(args, "blank", False) and not args.checkpoint:
+        return BLANK_CHECKPOINT
+    return resolve_checkpoint(args.checkpoint)
+
+
 def _state_dir_for(args) -> Path:
     """The same default `chat` and `serve` use, so `status` looks where they
     actually wrote."""
     from .chat import default_state_dir
-    from .pretrain import BLANK_CHECKPOINT, resolve_checkpoint
     if args.state_dir:
         return Path(args.state_dir)
-    if args.blank and not args.checkpoint:
-        return default_state_dir(BLANK_CHECKPOINT)
-    return default_state_dir(resolve_checkpoint(args.checkpoint))
+    return default_state_dir(_checkpoint_for(args))
 
 
 def _cmd_status(args) -> int:
@@ -220,18 +231,24 @@ def _cmd_teach(args) -> int:
         data_dir=args.data_dir, device=args.device, learning=True,
         blank=args.blank, learner_overrides=_learner_overrides(args),
     )
+    from .chat import _ctrl_c_stops
     failed = 0
     for f in args.files:
         path = Path(f)
         try:
-            report, summary = session.upload(
-                path.name, path.read_bytes(), speaker=args.speaker,
-                passes=args.passes, weight=args.weight, progress=_print_progress)
+            with _ctrl_c_stops() as stop:
+                report, summary = session.learn_file(
+                    path, path.name, speaker=args.speaker, passes=args.passes,
+                    weight=args.weight, progress=_print_progress,
+                    should_stop=stop.is_set)
         except (OSError, ValueError) as e:
-            print(f"can't learn from {path}: {e}")
+            print(f"\ncan't learn from {path}: {e}")
             failed += 1
             continue
-        print(f"{summary}\n  {report.line()}")
+        print(f"\r{summary}".ljust(60))
+        print(f"  {report.line()}")
+        if report.stopped:
+            break
     print(f"saved to {session.state_dir}")
     return 1 if failed else 0
 
@@ -369,6 +386,12 @@ def build_parser() -> argparse.ArgumentParser:
     ex = sub.add_parser("export", parents=[common],
                         help="write a compact, shareable copy of a checkpoint")
     ex.add_argument("--checkpoint", default=None)
+    ex.add_argument("--blank", action="store_true", help="export the blank model")
+    ex.add_argument("--state-dir", default=None,
+                    help="bake in what was learned in this state directory")
+    ex.add_argument("--with-learning", action="store_true",
+                    help="bake in what was learned (from the checkpoint's own "
+                         "state directory)")
     ex.add_argument("--out", default="checkpoints/aria-small.pt")
     ex.add_argument("--full-precision", action="store_true",
                     help="keep float32 instead of halving the file size")

@@ -7,16 +7,23 @@ exchange to the online learner, which decides whether to take a gradient step.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import shlex
+import signal
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator, Union
 
 from .config import LearnerConfig
 from .data import TokenStream
-from .documents import (extract_text, parse_transcript, speakers,
-                        strip_speaker_labels, transcript_dialogues)
-from .learner import OnlineLearner, Progress, UpdateReport, resume_learned_weights
+from .documents import (SUPPORTED_SUFFIXES, iter_dialogues, iter_lines, iter_turns,
+                        iter_units, parse_transcript, speakers, suffix_of)
+from .learner import (LearnProgress, OnlineLearner, Progress, StopCheck, UpdateReport,
+                      drive, resume_learned_weights)
+from .storage import process_ram_mb
 from .pretrain import (BLANK_CHECKPOINT, create_blank_checkpoint, load_checkpoint,
                        resolve_checkpoint)
 from .sample import build_chat_prompt, generate
@@ -29,8 +36,10 @@ commands:
   /memory [n]            show the n most recent remembered exchanges
   /teach <text>          learn from a passage directly (no reply generated)
   /upload <file> [as <name>]
-                         learn from a whole document (.txt .md .docx .srt .vtt .pdf);
-                         for a transcript, "as <name>" makes Aria answer like <name>
+                         read a document and learn from it (.txt .md .docx .srt .vtt
+                         .pdf), any size; Ctrl-C stops early and keeps what she learned.
+                         For a transcript, "as <name>" makes Aria answer like <name>.
+                         Dragging a file into the terminal does the same.
   /correct <text>        replace Aria's last reply with <text> and learn from it
   /learn on|off          enable or disable online learning
   /verbose on|off        show the learner's per-turn diagnostics
@@ -41,6 +50,15 @@ commands:
   /reset                 clear the current conversation context
   /quit                  save and exit
 """.strip()
+
+
+# How much of a file is read to decide whether it is a transcript.
+SNIFF_LINES = 400
+# During a long upload, what has been learned so far is saved this often, so a
+# crash or a closed laptop loses minutes, not hours.
+AUTOSAVE_SECONDS = 300
+
+FileSource = Union[str, Path, bytes]
 
 
 def default_state_dir(checkpoint: str | Path) -> Path:
@@ -176,44 +194,97 @@ class ChatSession:
         return self.learner.observe(self._recent_turns(), weight=3.0,
                                     kind="correction", force=True)
 
-    def upload(
+    def sniff(self, source: FileSource, name: str) -> tuple[list[str] | None, bool]:
+        """(speakers if `source` is a transcript, whether all of it was read).
+
+        Only the first SNIFF_LINES lines are read, so this is cheap for a
+        file of any size."""
+        head = list(itertools.islice(iter_lines(source, name), SNIFF_LINES + 1))
+        if not any(line.strip() for line in head):
+            raise ValueError(f"{name} contains no text")
+        turns = parse_transcript(head[:SNIFF_LINES])
+        return (speakers(turns) if turns else None), len(head) <= SNIFF_LINES
+
+    def iter_learn_file(
         self,
-        name: str,
-        data: bytes,
+        source: FileSource,
+        name: str | None = None,
         speaker: str | None = None,
         passes: int | None = None,
         weight: float = 1.0,
-        progress: Progress = None,
-    ) -> tuple[UpdateReport, str]:
-        """Learn from a whole file. Returns the report and a one-line summary.
+        should_stop: StopCheck = None,
+    ) -> Generator[LearnProgress, None, tuple[UpdateReport, str]]:
+        """Read a document and learn from it, one step per iteration.
 
-        A transcript with `speaker` named is learned as conversations in which
-        that person plays Aria. Anything else is learned as prose in Aria's
-        voice — for a transcript, with the speaker labels taken out so she
-        learns the speech and not the formatting."""
-        text = extract_text(name, data)
-        turns = parse_transcript(text)
-        if turns and speaker:
-            names = speakers(turns)
-            if not any(speaker.casefold() == n.casefold() for n in names):
+        `source` is a path (any size: it is streamed, never loaded whole) or
+        the bytes of a small file. A transcript with `speaker` named is
+        learned as conversations in which that person plays Aria; anything
+        else as prose in Aria's voice — for a transcript, with the speaker
+        labels taken out so she learns the speech and not the formatting.
+        Returns the report and a one-line summary."""
+        name = name or Path(str(source)).name
+        names, whole = self.sniff(source, name)
+
+        def lines():
+            return iter_lines(source, name)
+
+        if names and speaker:
+            if whole and not any(speaker.casefold() == n.casefold() for n in names):
                 raise ValueError(f"nobody called {speaker!r} speaks in {name}; "
                                  f"speakers are: {', '.join(names[:8])}")
-            convos = transcript_dialogues(turns, speaker)
-            report = self.learner.learn_dialogues(convos, passes=passes, weight=weight,
-                                                  name=name, progress=progress)
-            what = f"{len(convos)} replies by {speaker}"
+            gen = self.learner.iter_learn_dialogues(
+                lambda: iter_dialogues(iter_turns(lines()), speaker),
+                passes=passes, weight=weight, name=name, should_stop=should_stop)
         else:
-            if turns:
-                text = strip_speaker_labels(turns)
-            report = self.learner.learn_document(text, passes=passes, weight=weight,
-                                                 name=name, progress=progress)
-            what = f"{len(text.split())} words"
-            if turns:
-                what += (f" (a transcript: name a speaker to learn how one person "
-                         f"replies — speakers: {', '.join(speakers(turns)[:5])})")
+            if names:
+                make_units = lambda: iter_units(said for _, said in iter_turns(lines()))
+            else:
+                make_units = lambda: iter_units(lines())
+            gen = self.learner.iter_learn_units(make_units, passes=passes, weight=weight,
+                                                name=name, should_stop=should_stop)
+
+        last_save = time.monotonic()
+        while True:
+            try:
+                p = next(gen)
+            except StopIteration as done:
+                report = done.value
+                break
+            if time.monotonic() - last_save > AUTOSAVE_SECONDS:
+                self.save()
+                last_save = time.monotonic()
+            yield p
         # Learned material should survive a crash as surely as a chat turn.
         self.save()
+
+        if not report.applied:
+            if names and speaker:
+                raise ValueError(f"nobody called {speaker!r} answers anyone in {name}; "
+                                 f"speakers are: {', '.join(names[:8])}")
+            return report, f"nothing learned from {name}: {report.reason}"
+        if names and speaker:
+            what = f"{report.examples:,} replies by {speaker}"
+        else:
+            what = f"{report.words:,} words"
+            if names:
+                what += (f" (a transcript: name a speaker to learn how one person "
+                         f"replies — speakers: {', '.join(names[:5])})")
         return report, f"learned {name}: {what}"
+
+    def learn_file(self, source: FileSource, name: str | None = None,
+                   speaker: str | None = None, passes: int | None = None,
+                   weight: float = 1.0, progress: Progress = None,
+                   should_stop: StopCheck = None) -> tuple[UpdateReport, str]:
+        """`iter_learn_file`, run to the end."""
+        return drive(self.iter_learn_file(source, name, speaker, passes, weight,
+                                          should_stop), progress)
+
+    def upload(self, name: str, data: bytes, speaker: str | None = None,
+               passes: int | None = None, weight: float = 1.0,
+               progress: Progress = None) -> tuple[UpdateReport, str]:
+        """Learn from the bytes of a file (for small ones; large ones are
+        learned from disk with `learn_file`)."""
+        return self.learn_file(data, name, speaker, passes, weight, progress)
 
     def save(self) -> None:
         self.learner.save()
@@ -243,8 +314,11 @@ def run(session: ChatSession, banner: bool = True) -> None:
         if not line:
             continue
 
+        dropped = _dropped_file(line)
+        if dropped is not None:
+            line = "/upload " + shlex.quote(str(dropped))
         if line.startswith("/"):
-            if _command(session, line):
+            if _command(session, line, interactive=True):
                 break
             continue
 
@@ -259,7 +333,73 @@ def run(session: ChatSession, banner: bool = True) -> None:
     print("saved. goodbye.")
 
 
-def _command(session: ChatSession, line: str) -> bool:
+def _dropped_file(line: str) -> Path | None:
+    """A file dragged into the terminal arrives as its (often quoted) path."""
+    try:
+        words = shlex.split(line)
+    except ValueError:
+        return None
+    if len(words) != 1:
+        return None
+    raw = words[0]
+    if "/" not in raw and "\\" not in raw and raw == line:
+        return None             # a bare word is a message, even if a file has that name
+    path = Path(raw).expanduser()
+    if suffix_of(path.name) in SUPPORTED_SUFFIXES and path.is_file():
+        return path
+    return None
+
+
+@contextmanager
+def _ctrl_c_stops():
+    """Make Ctrl-C end a long upload cleanly instead of killing the program."""
+    stop = threading.Event()
+    if threading.current_thread() is not threading.main_thread():
+        yield stop
+        return
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    try:
+        yield stop
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def _upload_command(session: ChatSession, arg: str, interactive: bool) -> None:
+    try:
+        words = shlex.split(arg)
+    except ValueError as e:
+        print(f"  {e}")
+        return
+    speaker = None
+    if len(words) >= 3 and words[-2].lower() == "as":
+        speaker, words = words[-1], words[:-2]
+    if len(words) != 1:
+        print("  usage: /upload <file> [as <speaker name>]")
+        return
+    path = Path(words[0]).expanduser()
+    try:
+        names, _ = session.sniff(path, path.name)
+        if names and speaker is None and interactive:
+            print(f"  {path.name} looks like a conversation between "
+                  f"{', '.join(names[:6])}.")
+            answer = input("  learn to reply like who? (a name, or Enter to just "
+                           "learn the language) ").strip()
+            speaker = answer or None
+        size = path.stat().st_size
+        print(f"  reading {path.name} ({size / 1e6:.1f} MB) — Ctrl-C stops early "
+              f"and keeps what she has learned")
+        with _ctrl_c_stops() as stop:
+            report, summary = session.learn_file(path, path.name, speaker=speaker,
+                                                 progress=_print_progress,
+                                                 should_stop=stop.is_set)
+        print(f"\r  {summary}".ljust(60))
+        print(f"  {report.line()}")
+    except (OSError, ValueError) as e:
+        print(f"\n  can't learn from {path}: {e}")
+
+
+def _command(session: ChatSession, line: str, interactive: bool = False) -> bool:
     """Handle a slash command. Returns True if the session should end."""
     parts = line.split(maxsplit=1)
     cmd = parts[0].lower()
@@ -276,6 +416,9 @@ def _command(session: ChatSession, line: str) -> bool:
             v = f"{v:.4f}" if isinstance(v, float) else v
             print(f"  {k.ljust(width)}  {v}")
         print(f"  {'journal'.ljust(width)}  {session.learner.journal.summary()}")
+        ram = process_ram_mb()
+        if ram is not None:
+            print(f"  {'peak_ram_mb'.ljust(width)}  {ram:.0f}")
     elif cmd == "/memory":
         n = int(arg) if arg.isdigit() else 8
         for item in session.learner.replay.recent(n):
@@ -287,25 +430,7 @@ def _command(session: ChatSession, line: str) -> bool:
         else:
             print(" ", session.learner.observe_text(arg, weight=2.0).line())
     elif cmd == "/upload":
-        try:
-            words = shlex.split(arg)
-        except ValueError as e:
-            words = []
-            print(f"  {e}")
-        speaker = None
-        if len(words) >= 3 and words[-2].lower() == "as":
-            speaker, words = words[-1], words[:-2]
-        if len(words) != 1:
-            print("  usage: /upload <file> [as <speaker name>]")
-        else:
-            path = Path(words[0]).expanduser()
-            try:
-                report, summary = session.upload(
-                    path.name, path.read_bytes(), speaker=speaker,
-                    progress=_print_progress)
-                print(f"  {summary}\n  {report.line()}")
-            except (OSError, ValueError) as e:
-                print(f"  can't learn from {path}: {e}")
+        _upload_command(session, arg, interactive)
     elif cmd == "/correct":
         if not arg:
             print("  usage: /correct <what Aria should have said>")
@@ -342,6 +467,9 @@ def _command(session: ChatSession, line: str) -> bool:
     return False
 
 
-def _print_progress(step: int, total: int, lr: float) -> None:
-    print(f"\r  learning ... step {step}/{total}", end="\n" if step == total else "",
-          flush=True)
+def _print_progress(p: LearnProgress) -> None:
+    if p.phase == "reading":
+        msg = f"reading ... {p.examples:,} pieces so far"
+    else:
+        msg = f"learning ... step {p.step:,}/{p.total:,} ({100 * p.step / max(1, p.total):.0f}%)"
+    print(f"\r  {msg}".ljust(60), end="", flush=True)

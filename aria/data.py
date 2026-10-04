@@ -228,11 +228,21 @@ def encode_dialogue(
     Targets are IGNORE_INDEX everywhere except on the tokens Aria herself
     produces, so gradient only ever flows from Aria's own words.
     """
+    return encode_dialogue_ids(
+        tok, [tok.encode(" " + t.strip(), allowed_special=False) for t in turns],
+        block_size)
+
+
+def encode_dialogue_ids(
+    tok: BPETokenizer, turns: Sequence[Sequence[int]], block_size: int
+) -> tuple[list[int], list[int]] | None:
+    """`encode_dialogue` for turns that are already tokenized (each encoded
+    as `" " + text`, the chat format's convention)."""
     ids: list[int] = [tok.bos_id]
     loss_on: list[bool] = [False]
-    for i, turn in enumerate(turns):
+    for i, turn_ids in enumerate(turns):
         speaker = tok.user_id if i % 2 == 0 else tok.aria_id
-        body = tok.encode(" " + turn.strip(), allowed_special=False) + [tok.eot_id]
+        body = list(turn_ids) + [tok.eot_id]
         ids.append(speaker)
         loss_on.append(False)
         ids.extend(body)
