@@ -25,7 +25,6 @@ from typing import Iterator, Sequence
 import numpy as np
 import torch
 
-from .config import ModelConfig
 from .model import IGNORE_INDEX
 from .tokenizer import BPETokenizer
 
@@ -475,8 +474,14 @@ def mixed_batch(
     rng: random.Random,
     generator: torch.Generator | None,
     pad_id: int,
+    block_size: int | None = None,
 ):
-    """Interleave plain-text and chat-format examples in one optimiser step."""
+    """Interleave plain-text and chat-format examples in one optimiser step.
+
+    Chat examples were cut to the block size `prepare` was run with, which
+    need not be the model's: reusing data prepared for a 256-token model to
+    train a 128-token one would otherwise overflow the context. Over-long
+    examples keep their tail, where Aria's reply and its loss are."""
     n_chat = int(round(batch_size * chat_frac)) if chatset and len(chatset) else 0
     n_text = batch_size - n_chat
     parts = []
@@ -485,7 +490,10 @@ def mixed_batch(
         parts.extend(list(zip(x.tolist(), y.tolist())))
     if n_chat > 0 and chatset is not None:
         picks = [chatset.examples[rng.randrange(len(chatset))] for _ in range(n_chat)]
-        parts.extend([(list(a), list(b)) for a, b in picks])
+        for a, b in picks:
+            if block_size and len(a) > block_size:
+                a, b = a[-block_size:], b[-block_size:]
+            parts.append((list(a), list(b)))
     rng.shuffle(parts)
     return collate(parts, pad_id)
 

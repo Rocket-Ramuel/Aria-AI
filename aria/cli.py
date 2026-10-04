@@ -57,14 +57,17 @@ def _cmd_pretrain(args) -> int:
     return 0
 
 
-def _learner_overrides(args):
+def _learner_overrides(args) -> dict:
+    """Only the --learner-* flags actually given. They are applied on top of
+    the learner config stored in the checkpoint, so a flag changes one setting
+    instead of silently resetting the rest to the generic defaults."""
     from .config import LearnerConfig
-    cfg = LearnerConfig()
-    for field in dataclasses.fields(cfg):
+    out = {}
+    for field in dataclasses.fields(LearnerConfig):
         val = getattr(args, f"learner_{field.name}", None)
         if val is not None:
-            setattr(cfg, field.name, val)
-    return cfg
+            out[field.name] = val
+    return out
 
 
 def _cmd_chat(args) -> int:
@@ -74,9 +77,10 @@ def _cmd_chat(args) -> int:
         checkpoint=args.checkpoint,
         state_dir=args.state_dir,
         data_dir=args.data_dir,
-        learner_cfg=_learner_overrides(args),
+        learner_overrides=_learner_overrides(args),
         device=args.device,
         learning=not args.no_learn,
+        blank=args.blank,
         verbose=args.verbose,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
@@ -95,9 +99,11 @@ def _cmd_serve(args) -> int:
         host=args.host,
         port=args.port,
         open_browser=not args.no_browser,
-        learner_cfg=_learner_overrides(args),
+        allow_hosts=tuple(args.allow_host),
+        learner_overrides=_learner_overrides(args),
         device=args.device,
         learning=not args.no_learn,
+        blank=args.blank,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
     )
@@ -155,7 +161,9 @@ def _cmd_export(args) -> int:
     print(f"wrote {args.out}")
     print(f"  {info['source_mb']:.1f} MB -> {info['export_mb']:.1f} MB"
           f"  (half={info['half']}, fisher={info['fisher']})")
-    print(f"  trained {info['step']} steps, val loss {info['val_loss']:.4f}")
+    val = info["val_loss"]
+    val = f"{val:.4f}" if isinstance(val, float) else "n/a"
+    print(f"  trained {info['step']} steps, val loss {val}")
     return 0
 
 
@@ -174,9 +182,21 @@ def _cmd_sample(args) -> int:
     return 0
 
 
+def _state_dir_for(args) -> Path:
+    """The same default `chat` and `serve` use, so `status` looks where they
+    actually wrote."""
+    from .chat import default_state_dir
+    from .pretrain import BLANK_CHECKPOINT, resolve_checkpoint
+    if args.state_dir:
+        return Path(args.state_dir)
+    if args.blank and not args.checkpoint:
+        return default_state_dir(BLANK_CHECKPOINT)
+    return default_state_dir(resolve_checkpoint(args.checkpoint))
+
+
 def _cmd_status(args) -> int:
     from .memory import Journal, ReplayBuffer
-    state = Path(args.state_dir)
+    state = _state_dir_for(args)
     journal = Journal(state / "journal.jsonl")
     replay = ReplayBuffer.load(state / "replay.json")
     runtime = state / "learner_state.json"
@@ -192,21 +212,46 @@ def _cmd_status(args) -> int:
 
 
 def _cmd_teach(args) -> int:
-    """Batch-teach from a text file, one passage per line or per paragraph."""
-    from .chat import ChatSession
+    """Learn from whole files: prose as Aria's voice, transcripts as replies."""
+    from .chat import ChatSession, _print_progress
     torch.set_num_threads(args.threads)
     session = ChatSession(
         checkpoint=args.checkpoint, state_dir=args.state_dir,
         data_dir=args.data_dir, device=args.device, learning=True,
+        blank=args.blank, learner_overrides=_learner_overrides(args),
     )
-    text = Path(args.file).read_text(encoding="utf-8")
-    chunks = [c.strip() for c in text.split("\n\n") if len(c.strip()) > 40]
-    for i, chunk in enumerate(chunks[: args.limit], 1):
-        r = session.learner.observe_text(chunk, weight=args.weight)
-        print(f"[{i}/{min(len(chunks), args.limit)}] {r.line()}")
-    session.save()
+    failed = 0
+    for f in args.files:
+        path = Path(f)
+        try:
+            report, summary = session.upload(
+                path.name, path.read_bytes(), speaker=args.speaker,
+                passes=args.passes, weight=args.weight, progress=_print_progress)
+        except (OSError, ValueError) as e:
+            print(f"can't learn from {path}: {e}")
+            failed += 1
+            continue
+        print(f"{summary}\n  {report.line()}")
     print(f"saved to {session.state_dir}")
+    return 1 if failed else 0
+
+
+def _cmd_blank(args) -> int:
+    from .pretrain import create_blank_checkpoint
+    out = Path(args.out)
+    if out.exists() and not args.force:
+        print(f"{out} already exists; pass --force to replace it "
+              f"(its learned state in {out.parent / 'online'} is kept)")
+        return 1
+    create_blank_checkpoint(out, size=args.size, block_size=args.block_size)
+    print(f"wrote a blank {args.size} model to {out}. It knows no words yet:")
+    print(f"  aria teach --checkpoint {out} some_writing.txt")
+    print(f"  aria serve --checkpoint {out}")
     return 0
+
+
+BLANK_HELP = ("use a model with no pretraining (created at runs/blank/base.pt "
+              "if needed) that learns only from what you upload and say")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -264,7 +309,9 @@ def build_parser() -> argparse.ArgumentParser:
     ch.add_argument("--device", default="cpu")
     ch.add_argument("--no-learn", action="store_true", help="talk without updating weights")
     ch.add_argument("--verbose", action="store_true", help="print learner diagnostics each turn")
-    ch.add_argument("--max-new-tokens", type=int, default=96)
+    ch.add_argument("--blank", action="store_true", help=BLANK_HELP)
+    ch.add_argument("--max-new-tokens", type=int, default=None,
+                    help="reply length cap (default 96, or 240 for a byte-level blank model)")
     ch.add_argument("--temperature", type=float, default=0.85)
     _add_learner_flags(ch)
     ch.set_defaults(func=_cmd_chat)
@@ -299,8 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="bind address; leave as localhost unless you mean it")
     sv.add_argument("--port", type=int, default=8000)
     sv.add_argument("--no-browser", action="store_true")
+    sv.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                    help="extra hostname the page may be reached by (repeatable)")
     sv.add_argument("--no-learn", action="store_true")
-    sv.add_argument("--max-new-tokens", type=int, default=96)
+    sv.add_argument("--blank", action="store_true", help=BLANK_HELP)
+    sv.add_argument("--max-new-tokens", type=int, default=None)
     sv.add_argument("--temperature", type=float, default=0.85)
     sv.add_argument("--device", default="cpu")
     _add_learner_flags(sv)
@@ -328,19 +378,38 @@ def build_parser() -> argparse.ArgumentParser:
     ex.set_defaults(func=_cmd_export)
 
     st = sub.add_parser("status", parents=[common], help="report what the learner has been doing")
-    st.add_argument("--state-dir", default="runs/aria/online")
+    st.add_argument("--checkpoint", default=None)
+    st.add_argument("--state-dir", default=None,
+                    help="default: the 'online' directory next to the checkpoint")
+    st.add_argument("--blank", action="store_true", help="the blank model's state")
     st.set_defaults(func=_cmd_status)
 
-    te = sub.add_parser("teach", parents=[common], help="learn from a text file, paragraph by paragraph")
-    te.add_argument("file")
+    te = sub.add_parser("teach", parents=[common],
+                        help="learn from documents: writing samples, chat logs, transcripts")
+    te.add_argument("files", nargs="+", metavar="FILE",
+                    help=".txt .md .docx .srt .vtt (.pdf with pypdf installed)")
+    te.add_argument("--speaker", default=None,
+                    help="in a 'Name: words' transcript, learn to answer like this person")
+    te.add_argument("--passes", type=int, default=None,
+                    help="passes over each file (default from the learner config)")
     te.add_argument("--checkpoint", default=None,
                    help="defaults to runs/aria/base.pt, then checkpoints/aria-small.pt")
+    te.add_argument("--blank", action="store_true", help=BLANK_HELP)
     te.add_argument("--state-dir", default=None)
     te.add_argument("--data-dir", default="data")
     te.add_argument("--device", default="cpu")
-    te.add_argument("--limit", type=int, default=500)
-    te.add_argument("--weight", type=float, default=2.0)
+    te.add_argument("--weight", type=float, default=1.0)
+    _add_learner_flags(te)
     te.set_defaults(func=_cmd_teach)
+
+    bl = sub.add_parser("blank", parents=[common],
+                        help="create a model that knows nothing and learns only from you")
+    bl.add_argument("--out", default="runs/blank/base.pt")
+    bl.add_argument("--size", default="small", choices=["tiny", "small", "base"])
+    bl.add_argument("--block-size", type=int, default=512,
+                    help="context window in bytes")
+    bl.add_argument("--force", action="store_true")
+    bl.set_defaults(func=_cmd_blank)
 
     return p
 

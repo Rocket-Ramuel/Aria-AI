@@ -12,8 +12,12 @@ data/chat.pt
 data/tokenizer.json
 data/meta.json
 
-# Trained weights and everything the online learner accumulates
+# Trained weights and everything the online learner accumulates. The learner
+# writes next to its checkpoint, so for the shipped model that is
+# checkpoints/online/ -- and replay.json/journal.jsonl hold your conversations
+# in plain text, so no "online" directory anywhere is ever committed.
 runs/
+online/
 *.pt
 !tests/**/*.pt
 # ...except the shipped model, so a fresh clone can talk to Aria immediately

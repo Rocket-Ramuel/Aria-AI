@@ -7,6 +7,7 @@ encodable, so the model can never hit an unknown token.
 
 from __future__ import annotations
 
+import codecs
 import json
 import re
 from collections import defaultdict
@@ -247,6 +248,9 @@ class BPETokenizer:
             buf.extend(self.token_bytes[i])
         return buf.decode("utf-8", errors="replace")
 
+    def stream_decoder(self, skip_special: bool = True) -> "StreamDecoder":
+        return StreamDecoder(self, skip_special)
+
     # -- persistence --------------------------------------------------------
 
     def save(self, path: str | Path) -> None:
@@ -258,3 +262,28 @@ class BPETokenizer:
     def load(cls, path: str | Path) -> "BPETokenizer":
         d = json.loads(Path(path).read_text())
         return cls(merges=[tuple(m) for m in d["merges"]], specials=d["specials"])
+
+
+class StreamDecoder:
+    """Decode token ids one at a time for streaming output.
+
+    A byte-level token can end in the middle of a multi-byte UTF-8 character
+    ("é" or an emoji split across two tokens). Decoding each token on its own
+    turns those halves into U+FFFD; an incremental decoder holds the partial
+    bytes back until the character is complete.
+    """
+
+    def __init__(self, tok: BPETokenizer, skip_special: bool = True) -> None:
+        self.tok = tok
+        self.skip_special = skip_special
+        self._dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def feed(self, token_id: int) -> str:
+        if token_id < self.tok.n_special:
+            if self.skip_special:
+                return ""
+            return self._dec.decode(self.tok.specials[token_id].encode("utf-8"))
+        return self._dec.decode(self.tok.token_bytes[token_id])
+
+    def flush(self) -> str:
+        return self._dec.decode(b"", final=True)

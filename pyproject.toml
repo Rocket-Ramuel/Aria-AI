@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+pdf = ["pypdf>=4.0"]
 
 [project.scripts]
 aria = "aria.cli:main"
@@ -27,7 +28,7 @@ Homepage = "https://github.com/Rocket-Ramuel/Aria-AI"
 packages = ["aria"]
 
 [tool.setuptools.package-data]
-aria = ["../data/seed_dialogues.txt"]
+aria = ["seed_dialogues.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

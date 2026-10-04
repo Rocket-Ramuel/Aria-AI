@@ -7,6 +7,7 @@ to decide which weights are safe to move.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import random
@@ -15,16 +16,23 @@ from pathlib import Path
 
 import torch
 
-from .config import AriaConfig, ModelConfig, TrainConfig
+from .config import AriaConfig, ModelConfig, TrainConfig, blank_learner_config, preset
 from .data import ChatSet, TokenStream, mixed_batch
 from .model import GPT
 from .tokenizer import BPETokenizer
 
 
-def lr_at(step: int, cfg: TrainConfig) -> float:
+def lr_at(step: int, cfg: TrainConfig, horizon: int | None = None) -> float:
+    """Linear warmup, then cosine decay that reaches its floor at `horizon`.
+
+    `horizon` defaults to `max_steps`. Under a wall-clock budget the run ends
+    long before that, so the caller passes its projected final step instead;
+    otherwise the learning rate would still be near its peak when time ran out.
+    """
     if step < cfg.warmup_steps:
         return cfg.learning_rate * (step + 1) / max(1, cfg.warmup_steps)
-    progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
+    end = min(cfg.max_steps, horizon or cfg.max_steps)
+    progress = (step - cfg.warmup_steps) / max(1, end - cfg.warmup_steps)
     progress = min(1.0, progress)
     coeff = 0.5 * (1 + math.cos(math.pi * progress))
     min_lr = cfg.learning_rate * cfg.min_lr_frac
@@ -73,21 +81,30 @@ def estimate_fisher(
     Large entries mark weights the pretrained knowledge is sensitive to. The
     online learner uses this to pull those weights back hard while leaving the
     insensitive ones free to move.
+
+    The expectation is over *individual sequences*: each one gets its own
+    backward pass and its own squared gradient. Squaring the gradient of a
+    batch-mean loss instead would give (E[g])², which cancels wherever
+    sequences disagree and underestimates exactly the weights that matter.
     """
     model.eval()
     fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()
               if p.requires_grad}
+    device = next(model.parameters()).device
+    n_samples = 0
     for i in range(batches):
         x, y = stream.batch(batch_size, generator)
-        model.zero_grad(set_to_none=True)
-        _, loss, _ = model(x, y)
-        loss.backward()
-        for n, p in model.named_parameters():
-            if p.grad is not None and n in fisher:
-                fisher[n] += p.grad.detach() ** 2
+        for j in range(x.shape[0]):
+            model.zero_grad(set_to_none=True)
+            _, loss, _ = model(x[j : j + 1].to(device), y[j : j + 1].to(device))
+            loss.backward()
+            for n, p in model.named_parameters():
+                if p.grad is not None and n in fisher:
+                    fisher[n] += p.grad.detach() ** 2
+            n_samples += 1
     model.zero_grad(set_to_none=True)
     for n in fisher:
-        fisher[n] /= max(1, batches)
+        fisher[n] /= max(1, n_samples)
     model.train()
     return fisher
 
@@ -110,7 +127,10 @@ def save_checkpoint(path: Path, model: GPT, cfg: AriaConfig, tok: BPETokenizer,
 
 
 def load_checkpoint(path: str | Path, device: str = "cpu"):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    # weights_only: checkpoints get shared, and a full unpickle of a file
+    # someone sent you can run arbitrary code. Everything Aria stores is
+    # tensors and plain containers, which the restricted loader handles.
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     cfg = AriaConfig.from_dict(ckpt["config"])
     tok = BPETokenizer(merges=[tuple(m) for m in ckpt["tokenizer"]["merges"]],
                        specials=ckpt["tokenizer"]["specials"])
@@ -149,7 +169,7 @@ def export_checkpoint(src: str | Path, dst: str | Path, half: bool = True,
     (the weights are loaded back into a float32 model), which is the difference
     between a checkpoint that is reasonable to commit and one that is not.
     """
-    ckpt = torch.load(src, map_location="cpu", weights_only=False)
+    ckpt = torch.load(src, map_location="cpu", weights_only=True)
 
     def cast(d):
         return {k: (v.half() if half and v.is_floating_point() else v)
@@ -210,7 +230,16 @@ def pretrain(
     ckpt_path = out_dir / "base.pt"
     latest = out_dir / "latest.pt"
     if resume and latest.exists():
-        state = torch.load(latest, map_location=device, weights_only=False)
+        state = torch.load(latest, map_location=device, weights_only=True)
+        saved = state.get("config", {}).get("model")
+        if saved is not None and saved != dataclasses.asdict(model_cfg):
+            diff = {k: (saved.get(k), v) for k, v in dataclasses.asdict(model_cfg).items()
+                    if saved.get(k) != v}
+            raise ValueError(
+                f"{latest} was trained with a different model shape "
+                f"(saved vs requested: {diff}). Use the same --preset, pass "
+                f"--no-resume to start over, or choose another --out-dir."
+            )
         model.load_state_dict(state["model"])
         if "optimizer" in state:
             opt.load_state_dict(state["optimizer"])
@@ -231,8 +260,9 @@ def pretrain(
     step = start_step
     stop_reason = "max_steps"
 
+    horizon = None
     while step < train_cfg.max_steps:
-        lr = lr_at(step, train_cfg)
+        lr = lr_at(step, train_cfg, horizon)
         for group in opt.param_groups:
             group["lr"] = lr
 
@@ -240,7 +270,8 @@ def pretrain(
         total_loss = 0.0
         for _ in range(train_cfg.grad_accum):
             x, y = mixed_batch(train_stream, chatset, train_cfg.batch_size,
-                               chat_frac, rng, gen, tok.pad_id)
+                               chat_frac, rng, gen, tok.pad_id,
+                               block_size=model_cfg.block_size)
             x, y = x.to(device), y.to(device)
             _, loss, _ = model(x, y)
             (loss / train_cfg.grad_accum).backward()
@@ -251,6 +282,11 @@ def pretrain(
         step += 1
 
         elapsed = (time.time() - t0) / 60.0
+        if train_cfg.max_minutes and step - start_step >= 10 and elapsed > 0:
+            # Re-project where the time budget will end, so the cosine lands
+            # on its floor when time runs out rather than at max_steps.
+            rate = (step - start_step) / elapsed
+            horizon = int(step + rate * max(0.0, train_cfg.max_minutes - elapsed))
         if verbose and (step % 10 == 0 or step == 1):
             print(f"step {step}/{train_cfg.max_steps}  loss {total_loss:.4f}  "
                   f"lr {lr:.2e}  |g| {float(grad_norm):.2f}  {elapsed:.1f}m", flush=True)
@@ -293,3 +329,32 @@ def pretrain(
         print(f"saved {ckpt_path}  (step {step}, val loss {final_val:.4f}, "
               f"stopped on {stop_reason})", flush=True)
     return ckpt_path
+
+
+BLANK_CHECKPOINT = Path("runs/blank/base.pt")
+
+
+def create_blank_checkpoint(path: str | Path = BLANK_CHECKPOINT,
+                            size: str = "small", block_size: int = 512,
+                            seed: int = 1337) -> Path:
+    """A model that knows nothing: random weights, no vocabulary, no grammar.
+
+    The tokenizer has no merges, so it reads raw bytes — any language, any
+    spelling, nothing assumed about English. Everything this model ever says it
+    will have learned from the documents and messages it is given, which is
+    the point: its voice can only be the voice of the people it learns from.
+
+    The cost is that it says nothing coherent until it has read a fair amount.
+    Expect babble for the first few thousand words of text, recognisable
+    fragments of the source after a few tens of thousands.
+    """
+    path = Path(path)
+    tok = BPETokenizer(merges=[])
+    model_cfg = preset(size)
+    model_cfg.vocab_size = tok.vocab_size
+    # Bytes are short tokens; a longer window keeps a sentence or two in view.
+    model_cfg.block_size = block_size
+    cfg = AriaConfig(model=model_cfg, learner=blank_learner_config())
+    torch.manual_seed(seed)
+    save_checkpoint(path, GPT(model_cfg), cfg, tok, step=0, val_loss=float("nan"))
+    return path

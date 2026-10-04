@@ -22,8 +22,9 @@ learning survivable:
    proportion to that sensitivity; insensitive weights move freely.
 
 4. **A trust region.** After every step each tensor is projected back so it can
-   never drift more than `trust_radius` (relative) from its anchor. This caps
-   the damage a single conversation — or a deliberately adversarial one — can do.
+   never drift more than `trust_radius` (relative) from its anchor. The anchor
+   moves at each consolidation, so this bounds the drift *between*
+   consolidations; across many of them the canary is what bounds it.
 
 5. **A canary and rollback.** A fixed set of held-out English sentences is
    evaluated periodically. If loss on them rises past tolerance, the learner
@@ -35,19 +36,30 @@ learning survivable:
    the adapters are folded into the base weight matrices at this point and reset
    to zero — which is what makes the learning permanent rather than a growing
    pile of adapters.
+
+Two things are learned from each exchange: Aria's reply, and — when
+`style_mirror` is on — the user's own message, framed as if Aria had said it.
+The second is what makes her drift toward the voice of the person she talks
+to. Uploaded documents and transcripts go through `learn_document` and
+`learn_dialogues`, which take many steps over the material instead of one.
+
+A model created blank (`aria.pretrain.create_blank_checkpoint`) runs with
+`blank_learner_config()`, which switches off the safeguards that only exist to
+protect pretrained knowledge.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import math
 import random
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import torch
-import torch.nn as nn
 
 from .config import LearnerConfig
 from .data import TokenStream, collate, encode_dialogue
@@ -57,10 +69,20 @@ from .tokenizer import BPETokenizer
 
 FFN_KEYS = ("gate_proj", "up_proj", "down_proj")
 
+Example = tuple[list[int], list[int]]
+Progress = Optional[Callable[[int, int, float], None]]
+
+# How many chunks of one uploaded document are kept for later rehearsal. Enough
+# to keep the lesson alive, few enough that one book can't evict every
+# conversation from the reservoir.
+DOCUMENT_REPLAY_CHUNKS = 48
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
 
 @dataclass
 class UpdateReport:
-    """What the learner did with one exchange."""
+    """What the learner did with one exchange (or one uploaded document)."""
 
     applied: bool
     reason: str
@@ -74,6 +96,7 @@ class UpdateReport:
     rolled_back: bool = False
     consolidated: bool = False
     canary: Optional[float] = None
+    steps: int = 1
 
     def line(self) -> str:
         if not self.applied:
@@ -85,6 +108,8 @@ class UpdateReport:
             f"replay {self.replayed}",
             f"drift {self.drift:.3f}",
         ]
+        if self.steps > 1:
+            bits.insert(1, f"{self.steps} steps")
         if self.canary is not None:
             bits.append(f"canary {self.canary:.3f}")
         if self.consolidated:
@@ -126,10 +151,7 @@ class OnlineLearner:
         self.anchor = self._snapshot()
         self.last_good = self._snapshot()
 
-        self.opt = torch.optim.AdamW(
-            self.trainable, lr=cfg.learning_rate,
-            betas=(cfg.beta1, cfg.beta2), weight_decay=0.0,
-        )
+        self.opt = self._new_optimizer(cfg.learning_rate)
 
         self.canaries = self._encode_canaries(canary_texts(extra_canaries))
         self.canary_baseline = self.canary_loss()
@@ -138,6 +160,10 @@ class OnlineLearner:
         self.updates_applied = 0
         self.turns_seen = 0
         self.consecutive_bad = 0
+        # Counters rather than `updates_applied % interval`, so that a document
+        # upload taking many steps can't jump over a scheduled consolidation.
+        self.since_health = 0
+        self.since_consolidation = 0
 
         self._load_runtime_state()
 
@@ -151,7 +177,6 @@ class OnlineLearner:
             n = attach_lora(self.model, self.cfg.lora_rank, self.cfg.lora_alpha)
             if n == 0:
                 raise RuntimeError("no LoRA targets found in model")
-            self.model.to(self.device)
             for p in self.model.parameters():
                 p.requires_grad_(False)
             for p in lora_parameters(self.model):
@@ -164,12 +189,21 @@ class OnlineLearner:
                 p.requires_grad_(True)
         else:
             raise ValueError(f"unknown plasticity mode {mode!r}")
+        # New adapters are created on the CPU; every mode re-asserts the device
+        # so a consolidation never leaves part of the model behind.
+        self.model.to(self.device)
 
         self.trainable_names = [n for n, p in self.model.named_parameters()
                                 if p.requires_grad]
         self.trainable = [p for p in self.model.parameters() if p.requires_grad]
         if not self.trainable:
             raise RuntimeError(f"plasticity={mode!r} left no trainable parameters")
+
+    def _new_optimizer(self, lr: float) -> torch.optim.AdamW:
+        return torch.optim.AdamW(
+            self.trainable, lr=lr,
+            betas=(self.cfg.beta1, self.cfg.beta2), weight_decay=0.0,
+        )
 
     def _restrict_fisher(self, fisher):
         if not fisher or self.cfg.plasticity == "lora":
@@ -227,23 +261,104 @@ class OnlineLearner:
         return float(loss)
 
     @torch.no_grad()
-    def sequence_loss(self, example: tuple[list[int], list[int]]) -> float:
+    def sequence_loss(self, example: Example) -> float:
+        return self.mean_loss([example])
+
+    @torch.no_grad()
+    def mean_loss(self, examples: Sequence[Example]) -> float:
+        """Token-averaged loss over a few examples, evaluated in one batch."""
         was_training = self.model.training
         self.model.eval()
-        x, y = collate([example], self.tok.pad_id)
-        _, loss, _ = self.model(x.to(self.device), y.to(self.device))
+        x, y = self._batch(examples)
+        _, loss, _ = self.model(x, y)
         if was_training:
             self.model.train()
         return float(loss)
 
     # ------------------------------------------------------------------
-    # batch construction
+    # encoding
     # ------------------------------------------------------------------
 
-    def _encode_turns(self, turns: Sequence[str]):
+    def _encode_turns(self, turns: Sequence[str]) -> Example | None:
         return encode_dialogue(self.tok, turns, self.model.cfg.block_size)
 
-    def _replay_examples(self, n: int) -> list[tuple[list[int], list[int]]]:
+    def _text_example(self, text: str, min_tokens: int = 8) -> Example | None:
+        """`text` framed as something Aria said: <bos><aria> text <eot>.
+
+        This is how a document, or the user's own message, shapes Aria's
+        voice. Predicting the <aria> marker itself is not part of the lesson.
+        """
+        body = self.tok.encode(" " + text.strip(), allowed_special=False)
+        ids = [self.tok.bos_id, self.tok.aria_id] + body + [self.tok.eot_id]
+        ids = ids[: self.model.cfg.block_size + 1]
+        if len(ids) < min_tokens:
+            return None
+        x, y = ids[:-1], ids[1:]
+        y[0] = IGNORE_INDEX
+        return x, y
+
+    def _style_example(self, turns: Sequence[str]) -> Example | None:
+        """The user's latest message, as a lesson in how Aria should sound."""
+        if len(turns) < 2:
+            return None
+        return self._text_example(turns[-2], min_tokens=5)
+
+    def _document_windows(self, text: str) -> list[Example]:
+        """Cut a long text into overlapping context-sized training windows."""
+        block = self.model.cfg.block_size
+        ids = self.tok.encode(text.strip(), allowed_special=False)
+        span = block - 2                    # leaves room for <bos><aria>
+        stride = max(1, (span * 3) // 4)
+        windows: list[Example] = []
+        for start in range(0, max(1, len(ids) - span // 4), stride):
+            chunk = ids[start : start + span]
+            if len(chunk) < 6:
+                break
+            seq = [self.tok.bos_id, self.tok.aria_id] + chunk
+            if start + span >= len(ids):
+                seq.append(self.tok.eot_id)
+            x, y = seq[:-1], seq[1:]
+            y[0] = IGNORE_INDEX
+            windows.append((x, y))
+        return windows
+
+    def _document_exchanges(self, text: str, limit: int = 2000) -> list[Example]:
+        """The document as a run of exchanges: each sentence answers the last.
+
+        Windows teach Aria to *continue* text in a voice; replies are produced
+        after `<user> ... <eot><aria>`, a context windows never show. Pairing
+        consecutive sentences puts the same voice in that position, so it is
+        learned as a way of answering. For a model with no pretraining this is
+        the difference between memorising a sample and replying in its style.
+        """
+        units = [u.strip() for line in text.splitlines()
+                 for u in _SENTENCE_END.split(line) if len(u.strip()) > 1]
+        out: list[Example] = []
+        for a, b in zip(units, units[1:]):
+            enc = self._encode_turns([a, b])
+            if enc is not None:
+                out.append(enc)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _replay_item_example(self, item: dict) -> Example | None:
+        turns = item["turns"]
+        kind = item.get("kind", "chat")
+        if kind == "document":
+            return self._text_example(turns[-1])
+        if kind == "chat":
+            # The stored reply is Aria's own sample. When she isn't meant to
+            # learn from those, rehearse the user's words instead.
+            if not self.cfg.learn_own_replies:
+                return self._style_example(turns)
+            if self.cfg.style_mirror and self.rng.random() < 0.5 * self.cfg.style_weight:
+                style = self._style_example(turns)
+                if style is not None:
+                    return style
+        return self._encode_turns(turns)
+
+    def _replay_examples(self, n: int) -> list[Example]:
         """Half from past conversations, half from the pretraining corpus.
 
         The corpus half is what actually anchors English; the conversation half
@@ -253,9 +368,9 @@ class OnlineLearner:
         n_pre = int(round(n * self.cfg.pretrain_replay_frac)) if self.pretrain_stream else 0
         n_chat = n - n_pre
 
-        out: list[tuple[list[int], list[int]]] = []
+        out: list[Example] = []
         for item in self.replay.sample(n_chat):
-            enc = self._encode_turns(item["turns"])
+            enc = self._replay_item_example(item)
             if enc is not None:
                 out.append(enc)
             if len(out) >= n_chat:
@@ -266,6 +381,11 @@ class OnlineLearner:
             out.extend([(x.tolist(), y.tolist()) for x, y in zip(xb, yb)])
         return out
 
+    def _batch(self, examples: Sequence[Example]):
+        x, y = collate(examples, self.tok.pad_id)
+        block = self.model.cfg.block_size
+        return x[:, :block].to(self.device), y[:, :block].to(self.device)
+
     # ------------------------------------------------------------------
     # regularisation
     # ------------------------------------------------------------------
@@ -273,12 +393,13 @@ class OnlineLearner:
     def _anchor_penalty(self) -> torch.Tensor:
         named = dict(self.model.named_parameters())
         total = torch.zeros((), device=self.device)
+        if self.cfg.l2_anchor == 0 and (self.cfg.ewc_lambda == 0 or not self.fisher):
+            return total
         for n in self.trainable_names:
             p = named[n]
             if self.cfg.plasticity == "lora":
                 # Anchor is the zero adapter: keep the correction small.
-                delta_sq = p.pow(2).sum()
-                total = total + self.cfg.l2_anchor * delta_sq
+                total = total + self.cfg.l2_anchor * p.pow(2).sum()
                 continue
             delta = p - self.anchor[n]
             total = total + self.cfg.l2_anchor * delta.pow(2).sum()
@@ -291,8 +412,10 @@ class OnlineLearner:
     def _project_trust_region(self) -> float:
         """Clip each tensor back inside its allowed distance from the anchor.
 
-        Returns the largest relative drift observed (after projection)."""
+        Returns the largest relative drift observed (after projection). A
+        `trust_radius` of 0 disables the projection but still reports drift."""
         radius = self.cfg.trust_radius
+        clip = radius > 0
         max_drift = 0.0
         named = dict(self.model.named_parameters())
 
@@ -300,12 +423,9 @@ class OnlineLearner:
             for module in self.model.modules():
                 if not isinstance(module, LoRALinear):
                     continue
-                base_norm = module.base.weight.norm()
                 delta = (module.lora_B @ module.lora_A) * module.scaling
-                dn = float(delta.norm())
-                bn = float(base_norm) + 1e-12
-                rel = dn / bn
-                if rel > radius:
+                rel = float(delta.norm()) / (float(module.base.weight.norm()) + 1e-12)
+                if clip and rel > radius:
                     module.lora_B.mul_(radius / rel)
                     rel = radius
                 max_drift = max(max_drift, rel)
@@ -315,10 +435,8 @@ class OnlineLearner:
             p = named[n]
             a = self.anchor[n]
             delta = p - a
-            dn = float(delta.norm())
-            an = float(a.norm()) + 1e-12
-            rel = dn / an
-            if rel > radius:
+            rel = float(delta.norm()) / (float(a.norm()) + 1e-12)
+            if clip and rel > radius:
                 p.copy_(a + delta * (radius / rel))
                 rel = radius
             max_drift = max(max_drift, rel)
@@ -327,6 +445,32 @@ class OnlineLearner:
     # ------------------------------------------------------------------
     # the update
     # ------------------------------------------------------------------
+
+    def _step(self, batch: Sequence[Example], lr: float) -> tuple[float, float]:
+        """One optimiser step on `batch`, then the trust-region projection."""
+        for g in self.opt.param_groups:
+            g["lr"] = lr
+        self.model.train()
+        x, y = self._batch(batch)
+        self.opt.zero_grad(set_to_none=True)
+        _, ce, _ = self.model(x, y)
+        (ce + self._anchor_penalty()).backward()
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(self.trainable, self.cfg.grad_clip))
+        self.opt.step()
+        return grad_norm, self._project_trust_region()
+
+    def _after_update(self, report: UpdateReport) -> None:
+        """Health check and consolidation, on their own schedules."""
+        self.updates_applied += 1
+        self.since_health += 1
+        self.since_consolidation += 1
+        if self.cfg.health_check and self.since_health >= self.cfg.health_interval:
+            self.since_health = 0
+            report.canary = self._health_check(report)
+        if (self.since_consolidation >= self.cfg.consolidate_interval
+                and not report.rolled_back):
+            self.since_consolidation = 0
+            report.consolidated = self.consolidate()
 
     def observe(
         self,
@@ -342,11 +486,17 @@ class OnlineLearner:
         are worth more than greetings). `force` bypasses the surprise gate.
         """
         self.turns_seen += 1
-        example = self._encode_turns(turns)
-        if example is None:
-            return UpdateReport(False, "unencodable", 0.0, 0.0, 0.0, self.lr)
+        reply = self._encode_turns(turns)
+        # A correction is the user's own wording, so it is always learned; an
+        # ordinary reply only when the config says Aria's own words count.
+        if not (self.cfg.learn_own_replies or kind != "chat"):
+            reply = None
+        style = self._style_example(turns) if self.cfg.style_mirror else None
+        lesson = [e for e in (reply, style) if e is not None]
+        if not lesson:
+            return UpdateReport(False, "nothing to learn from", 0.0, 0.0, 0.0, self.lr)
 
-        loss_before = self.sequence_loss(example)
+        loss_before = self.mean_loss(lesson)
         if self.ema_loss is None:
             self.ema_loss = loss_before
         surprise = loss_before - self.ema_loss
@@ -376,47 +526,29 @@ class OnlineLearner:
             self.cfg.max_lr_scale,
             max(1.0, 1.0 + self.cfg.lr_surprise_scale * rel_surprise),
         ) * max(0.1, weight)
-        for g in self.opt.param_groups:
-            g["lr"] = lr
 
-        self.model.train()
         replay_examples = self._replay_examples(self.cfg.replay_batch)
-        grad_norm = 0.0
+        # Next to a reply, the style lesson joins the batch with probability
+        # `style_weight` rather than through loss scaling, which keeps the loss
+        # a plain token average like everywhere else.
+        batch = list(lesson) + replay_examples
+        if style is not None and reply is not None and self.cfg.style_weight < 1.0:
+            if self.rng.random() > self.cfg.style_weight:
+                batch.remove(style)
 
+        grad_norm = drift = 0.0
         for _ in range(max(1, self.cfg.steps_per_turn)):
-            batch = [example] + replay_examples
-            x, y = collate(batch, self.tok.pad_id)
-            x = x[:, : self.model.cfg.block_size].to(self.device)
-            y = y[:, : self.model.cfg.block_size].to(self.device)
-
-            self.opt.zero_grad(set_to_none=True)
-            _, ce, _ = self.model(x, y)
-            loss = ce + self._anchor_penalty()
-            loss.backward()
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(self.trainable, self.cfg.grad_clip)
-            )
-            self.opt.step()
-
-        drift = self._project_trust_region()
-        self.updates_applied += 1
-        loss_after = self.sequence_loss(example)
+            grad_norm, drift = self._step(batch, lr)
+        loss_after = self.mean_loss(lesson)
 
         report = UpdateReport(
             applied=True, reason="learned", loss_before=loss_before,
             loss_after=loss_after, surprise=surprise, lr=lr,
             grad_norm=grad_norm, drift=drift, replayed=len(replay_examples),
         )
-
-        if self.updates_applied % self.cfg.health_interval == 0:
-            report.canary = self._health_check(report)
-        if (self.updates_applied % self.cfg.consolidate_interval == 0
-                and not report.rolled_back):
-            self.consolidate()
-            report.consolidated = True
-
+        self._after_update(report)
         self.journal.write(
-            event="update", applied=True, loss_before=loss_before,
+            event="update", applied=True, kind=kind, loss_before=loss_before,
             loss_after=loss_after, surprise=surprise, lr=lr, drift=drift,
             replayed=len(replay_examples), canary=report.canary,
             rolled_back=report.rolled_back, turns=list(turns),
@@ -424,51 +556,133 @@ class OnlineLearner:
         return report
 
     def observe_text(self, text: str, weight: float = 1.0) -> UpdateReport:
-        """Learn from a document rather than an exchange.
+        """Learn from a short passage in a single step (`/teach`).
 
-        The whole passage is treated as Aria's own output so gradient flows over
-        all of it — this is how you teach her a body of text rather than a reply.
-        """
-        ids = [self.tok.bos_id, self.tok.aria_id]
-        ids += self.tok.encode(" " + text.strip(), allowed_special=False)
-        ids += [self.tok.eot_id]
-        ids = ids[: self.model.cfg.block_size + 1]
-        if len(ids) < 8:
+        For anything longer than a paragraph use `learn_document`, which
+        covers the whole text and takes several passes over it."""
+        example = self._text_example(text)
+        if example is None:
             return UpdateReport(False, "too short", 0.0, 0.0, 0.0, self.lr)
-        example = (ids[:-1], ids[1:])
+        self.replay.add(["(document)", text], weight=weight, kind="document")
+        return self._train([example], passes=1, weight=weight, kind="teach")
 
-        loss_before = self.sequence_loss(example)
+    def learn_document(
+        self,
+        text: str,
+        passes: int | None = None,
+        weight: float = 1.0,
+        name: str = "document",
+        progress: Progress = None,
+    ) -> UpdateReport:
+        """Learn the voice of a whole document: several passes over it.
+
+        The text is cut into overlapping windows that fill the context, and
+        each window is learned as if Aria had written it. A sample of the
+        document is filed into the replay buffer so later conversations keep
+        rehearsing it."""
+        windows = self._document_windows(text)
+        if not windows:
+            return UpdateReport(False, "too short", 0.0, 0.0, 0.0, self.lr)
+        self._remember_document(text, weight)
+        examples = windows + self._document_exchanges(text)
+        return self._train(examples, passes, weight, kind="document", name=name,
+                           progress=progress)
+
+    def learn_dialogues(
+        self,
+        convos: Sequence[Sequence[str]],
+        passes: int | None = None,
+        weight: float = 1.0,
+        name: str = "transcript",
+        progress: Progress = None,
+    ) -> UpdateReport:
+        """Learn how someone answers, from conversations in which they play Aria.
+
+        Each conversation alternates user/aria and ends on the line to learn
+        (see `aria.documents.transcript_dialogues`)."""
+        examples = [e for e in (self._encode_turns(c) for c in convos) if e is not None]
+        if not examples:
+            return UpdateReport(False, "no usable exchanges", 0.0, 0.0, 0.0, self.lr)
+        keep = self.rng.sample(list(convos), min(len(convos), DOCUMENT_REPLAY_CHUNKS))
+        for c in keep:
+            self.replay.add(list(c), weight=weight, kind="transcript")
+        return self._train(examples, passes, weight, kind="transcript", name=name,
+                           progress=progress)
+
+    def _remember_document(self, text: str, weight: float) -> None:
+        paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 40]
+        if len(paragraphs) < 4:
+            # One long block: fall back to fixed-size pieces.
+            flat = " ".join(text.split())
+            paragraphs = [flat[i : i + 600] for i in range(0, len(flat), 600)]
+        if len(paragraphs) > DOCUMENT_REPLAY_CHUNKS:
+            paragraphs = self.rng.sample(paragraphs, DOCUMENT_REPLAY_CHUNKS)
+        for p in paragraphs:
+            self.replay.add(["(document)", p], weight=weight, kind="document")
+
+    def _train(
+        self,
+        examples: list[Example],
+        passes: int | None,
+        weight: float,
+        kind: str,
+        name: str = "",
+        progress: Progress = None,
+    ) -> UpdateReport:
+        """Several shuffled passes over `examples`, with rehearsal mixed in."""
+        passes = max(1, passes or self.cfg.document_passes)
+        bs = max(1, self.cfg.document_batch)
+        steps_per_pass = math.ceil(len(examples) / bs)
+        total = passes * steps_per_pass
+        lr = self.lr * max(0.1, weight)
+        if kind in ("document", "transcript"):
+            total = max(total, self.cfg.document_min_steps)
+            lr *= self.cfg.document_lr_scale
+        total = min(total, max(1, self.cfg.document_max_steps))
+        probe = examples if len(examples) <= 16 else self.rng.sample(examples, 16)
+
+        loss_before = self.mean_loss(probe)
         if self.ema_loss is None:
             self.ema_loss = loss_before
-        self.replay.add(["(document)", text], weight=weight, kind="document")
 
-        lr = self.lr * max(0.1, weight)
-        for g in self.opt.param_groups:
-            g["lr"] = lr
+        report = UpdateReport(True, f"learned {kind}", loss_before, loss_before,
+                              loss_before - self.ema_loss, lr, steps=0)
+        order: list[int] = []
+        replayed = 0
+        for step in range(total):
+            if not order:
+                order = list(range(len(examples)))
+                self.rng.shuffle(order)
+            batch = [examples[order.pop()] for _ in range(min(bs, len(order)))]
+            # Fewer rehearsal samples than in chat: the document is the point,
+            # and the batch already holds several windows of it.
+            replay = self._replay_examples(max(1, self.cfg.replay_batch // 2))
+            replayed += len(replay)
+            report.grad_norm, report.drift = self._step(batch + replay, lr)
+            report.steps += 1
 
-        self.model.train()
-        replay_examples = self._replay_examples(self.cfg.replay_batch)
-        x, y = collate([example] + replay_examples, self.tok.pad_id)
-        x = x[:, : self.model.cfg.block_size].to(self.device)
-        y = y[:, : self.model.cfg.block_size].to(self.device)
-        self.opt.zero_grad(set_to_none=True)
-        _, ce, _ = self.model(x, y)
-        (ce + self._anchor_penalty()).backward()
-        gn = float(torch.nn.utils.clip_grad_norm_(self.trainable, self.cfg.grad_clip))
-        self.opt.step()
-        drift = self._project_trust_region()
-        self.updates_applied += 1
+            step_report = UpdateReport(True, "", 0.0, 0.0, 0.0, lr)
+            self._after_update(step_report)
+            report.consolidated |= step_report.consolidated
+            if step_report.canary is not None:
+                report.canary = step_report.canary
+            if step_report.rolled_back:
+                # The safety net judged this material harmful; stop rather
+                # than keep pushing the model somewhere it just rolled back from.
+                report.rolled_back = True
+                break
+            if progress is not None:
+                progress(step + 1, total, lr)
 
-        loss_after = self.sequence_loss(example)
-        report = UpdateReport(True, "learned document", loss_before, loss_after,
-                              loss_before - (self.ema_loss or loss_before), lr,
-                              gn, drift, len(replay_examples))
-        if self.updates_applied % self.cfg.health_interval == 0:
-            report.canary = self._health_check(report)
-        self.journal.write(event="update", applied=True, kind="document",
-                           loss_before=loss_before, loss_after=loss_after,
-                           lr=lr, drift=drift, canary=report.canary,
-                           rolled_back=report.rolled_back)
+        report.loss_after = self.mean_loss(probe)
+        report.replayed = replayed
+        self.journal.write(
+            event="update", applied=True, kind=kind, name=name,
+            examples=len(examples), steps=report.steps,
+            loss_before=report.loss_before, loss_after=report.loss_after,
+            lr=lr, drift=report.drift, canary=report.canary,
+            rolled_back=report.rolled_back, consolidated=report.consolidated,
+        )
         return report
 
     # ------------------------------------------------------------------
@@ -493,21 +707,21 @@ class OnlineLearner:
 
     def rollback(self, canary: float) -> None:
         self._restore(self.last_good)
-        self.opt = torch.optim.AdamW(
-            self.trainable, lr=self.lr,
-            betas=(self.cfg.beta1, self.cfg.beta2), weight_decay=0.0,
-        )
+        self.opt = self._new_optimizer(self.lr)
         self.lr *= self.cfg.rollback_lr_decay
         self.journal.write(event="rollback", canary=canary,
                            baseline=self.canary_baseline, new_lr=self.lr)
 
-    def consolidate(self) -> None:
-        """Accept the current weights and make the learning permanent."""
+    def consolidate(self) -> bool:
+        """Accept the current weights and make the learning permanent.
+
+        Returns False when the canary says the model is not healthy enough."""
         canary = self.canary_loss()
-        if canary > self.canary_baseline * (1.0 + self.cfg.health_tolerance):
+        if (self.cfg.health_check
+                and canary > self.canary_baseline * (1.0 + self.cfg.health_tolerance)):
             # Not healthy enough to consolidate; leave the snapshot alone.
             self.journal.write(event="consolidate", skipped=True, canary=canary)
-            return
+            return False
 
         if self.cfg.plasticity == "lora":
             # Fold the adapters into the real weight matrices, then start fresh
@@ -516,10 +730,7 @@ class OnlineLearner:
             merge_lora(self.model)
             self._configure_plasticity()
             self.anchor = self._snapshot()
-            self.opt = torch.optim.AdamW(
-                self.trainable, lr=self.lr,
-                betas=(self.cfg.beta1, self.cfg.beta2), weight_decay=0.0,
-            )
+            self.opt = self._new_optimizer(self.lr)
         else:
             with torch.no_grad():
                 named = dict(self.model.named_parameters())
@@ -532,6 +743,7 @@ class OnlineLearner:
         self.journal.write(event="consolidate", skipped=False, canary=canary,
                            baseline=self.canary_baseline,
                            updates=self.updates_applied)
+        return True
 
     # ------------------------------------------------------------------
     # persistence
@@ -544,25 +756,27 @@ class OnlineLearner:
         p = self._runtime_path()
         if not p.exists():
             return
-        import json
         d = json.loads(p.read_text())
         self.lr = d.get("lr", self.lr)
         self.ema_loss = d.get("ema_loss", self.ema_loss)
         self.updates_applied = d.get("updates_applied", 0)
         self.turns_seen = d.get("turns_seen", 0)
+        self.since_health = d.get("since_health", 0)
+        self.since_consolidation = d.get("since_consolidation", 0)
         if "canary_baseline" in d:
             # The stored baseline belongs to the stored weights. Keep whichever
             # is lower so a fresh, better model is not held to a stale bar.
             self.canary_baseline = min(self.canary_baseline, d["canary_baseline"])
 
     def save(self, weights: bool = True) -> None:
-        import json
         self.replay.save(self.state_dir / "replay.json")
         self._runtime_path().write_text(json.dumps({
             "lr": self.lr,
             "ema_loss": self.ema_loss,
             "updates_applied": self.updates_applied,
             "turns_seen": self.turns_seen,
+            "since_health": self.since_health,
+            "since_consolidation": self.since_consolidation,
             "canary_baseline": self.canary_baseline,
             "plasticity": self.cfg.plasticity,
         }, indent=2))
@@ -605,6 +819,13 @@ def resume_learned_weights(model: GPT, state_dir: str | Path,
     p = Path(state_dir) / "learned.pt"
     if not p.exists():
         return False
-    state = torch.load(p, map_location=device, weights_only=False)
-    model.load_state_dict(state["model"])
+    state = torch.load(p, map_location=device, weights_only=True)
+    try:
+        model.load_state_dict(state["model"])
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"{p} was learned on top of a different model than the one being "
+            f"loaded. Point --state-dir somewhere else, or delete {p.parent} "
+            f"to start over.\n{e}"
+        ) from None
     return True

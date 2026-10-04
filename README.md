@@ -13,7 +13,13 @@ Two halves:
    conversational turn and writes the result back into the model's own weights,
    with the machinery required to make that survivable rather than destructive.
 
-The second half is the interesting one. Doing continual learning *naively* —
+You can also hand it **documents** — a writing sample, a chat log, the
+transcript of someone talking — and it will learn to sound like them, and, for
+a transcript, to answer the way a chosen person answers. And if you want
+nothing between it and the people it learns from, you can start it **blank**:
+no pretraining, no vocabulary, no grammar, only what you give it.
+
+The online learning is the interesting part. Doing continual learning *naively* —
 one SGD step per turn on whatever the user just typed — reliably destroys a
 language model within a few hundred turns. Most of this repo is about not doing
 that.
@@ -132,6 +138,12 @@ and each turn shows what the learner decided.
 It binds to localhost. Anything typed into that page gets written into the
 model's weights and to disk, so don't put it on a public interface.
 
+Binding to localhost does not on its own stop *other web pages* in your browser
+from talking to it, so the server also refuses any request whose `Host` or
+`Origin` isn't its own page, and any POST that isn't JSON. That blocks
+cross-site form posts and DNS-rebinding pages. If you deliberately serve it on
+your network, name the hosts it may be reached by with `--allow-host`.
+
 ### The terminal
 
 ```
@@ -156,7 +168,11 @@ On four CPU cores, the `small` preset runs about 70 training steps per minute,
 and a chat reply takes a second or two. Each turn's learning update costs about
 as much as one more reply. It is comfortably interactive.
 
-Everything the learner accumulates lives in `runs/aria/online/`:
+Everything the learner accumulates lives in an `online/` directory next to the
+checkpoint it is learning on top of — `checkpoints/online/` for the shipped
+model, `runs/aria/online/` for one you trained, `runs/blank/online/` for a
+blank one. (`.gitignore` excludes every `online/` directory: the replay buffer
+and journal contain your conversations in plain text.)
 
 | file | contents |
 | --- | --- |
@@ -166,7 +182,85 @@ Everything the learner accumulates lives in `runs/aria/online/`:
 | `learner_state.json` | learning rate, surprise baseline, canary baseline |
 
 Delete that directory to reset Aria to her post-pretraining state. The base
-checkpoint is never modified.
+checkpoint is never modified. `aria status` reads the same directory `chat`
+and `serve` write to.
+
+---
+
+## Teaching it a voice
+
+### Upload a document
+
+In the browser, open **Teach from a file** under the message box (or drop a
+file anywhere on the page). In the terminal, `/upload path/to/file`. In bulk,
+`aria teach file1.txt file2.docx ...`.
+
+Readable formats: `.txt`, `.md`, `.docx`, `.srt`/`.vtt` subtitles (timings
+and cue numbers are stripped, leaving what was said), and `.pdf` if you
+`pip install pypdf`. Audio is not supported — turning speech into text needs a
+speech-recognition model, which this project doesn't include. Transcribe the
+recording first and upload the transcript.
+
+What happens to the text depends on what it is:
+
+- **Prose** — an essay, letters, a diary — is cut into context-sized windows
+  and learned *as if Aria had written it*. It is also cut into a run of
+  exchanges, each sentence answering the one before, so the voice is learned as
+  a way of *replying*, not only of continuing text.
+- **A transcript or chat log** — lines like `Sam: are you coming tonight?` —
+  becomes conversations when you name a speaker (`as Jo` in the terminal, the
+  name box in the browser, `--speaker Jo` for `teach`). Jo's lines become
+  Aria's side and everyone else's become the prompts, so she learns how Jo
+  *answers*. Without a name, the labels are stripped and it is learned as prose.
+
+An upload takes several passes over the material (default 3, at least 24 steps,
+at most 400) at three times the chat learning rate, with rehearsal mixed in and
+every safeguard below still running. On the shipped model, a 200-word sample
+drops from loss 6.4 to 3.8 in about 6 seconds with held-out English unchanged.
+A sample of each upload is kept in the replay buffer, so later conversations
+keep rehearsing it.
+
+### Your own messages
+
+By default Aria also learns from what *you* type, framed as something she
+said (`--learner-style-mirror false` turns it off). Over a conversation that
+pulls her phrasing toward yours. Her own replies are learned too, at the same
+time; the blank model below skips those, since rehearsing her own babble would
+teach her nothing.
+
+### Start blank: no pretraining at all
+
+```bash
+aria serve --blank        # or: aria chat --blank, aria teach --blank sample.txt
+```
+
+`--blank` uses `runs/blank/base.pt`, creating it if needed (`aria blank` makes
+one explicitly, `--size tiny|small|base`). It is a model with random weights
+and a byte-level tokenizer with no learned vocabulary: it assumes nothing
+about English, spelling or grammar. Everything it ever produces it learned
+from what you uploaded and said, so its voice can only be the voice of its
+sources.
+
+It runs with different learner settings, stored in its checkpoint: full
+plasticity, a 10× higher learning rate, and none of the anchors, trust region,
+EWC or canary. Those exist to protect knowledge a model already has, and a
+blank model has none to protect.
+
+**Expect it to be slow to talk.** Measured on a CPU, uploading a 1,700-word
+writing sample:
+
+| after | loss | a reply to "what do you like?" |
+| --- | --- | --- |
+| 32 steps (~20 s) | 2.7 | `endrog s weios,at,lllr. noanthate a maudiorep.` |
+| 190 steps (~2 min) | 1.0 | `I have on pay.` |
+| 580 steps (~6 min) | 0.14 | `Thart made cors on before conversations, I do not have a uext I will day ow.` |
+
+It finds letters, then words, then the shape of a sentence in the source's
+style — but 1,700 words is far too little to learn a language from, and it
+mostly recombines what it read. Give it tens of thousands of words of one
+person's writing or transcribed speech and run several uploads; it will stay a
+mimic, not a conversationalist. If you want sensible replies *in* someone's
+voice, the pretrained model plus uploads gets you there much sooner.
 
 ---
 
@@ -204,7 +298,9 @@ because "no, say it like this" is the highest-value signal available.
 ### 3. Elastic weight consolidation — protect the weights that matter
 
 At the end of pretraining, `estimate_fisher` computes the diagonal empirical
-Fisher information, `E[(∂L/∂θ)²]`, over the pretraining data. Large entries mark
+Fisher information, `E[(∂L/∂θ)²]`, over the pretraining data, with one
+backward pass per sequence (squaring a batch-averaged gradient would measure
+something smaller). Large entries mark
 weights that the model's existing knowledge is sensitive to.
 
 Online updates add a penalty `λ · Σᵢ Fᵢ(θᵢ − θ*ᵢ)²`, pulling sensitive weights
@@ -215,10 +311,15 @@ protecting it.
 ### 4. A trust region — bound the blast radius of one conversation
 
 After every step each tensor is projected back so that
-`‖θ − θ_anchor‖ / ‖θ_anchor‖ ≤ trust_radius` (default 5%). No single
-conversation — including a deliberately adversarial one — can move the model
-arbitrarily far. In LoRA mode the bound is applied to the effective weight
-delta `BA·(α/r)` relative to the frozen base matrix.
+`‖θ − θ_anchor‖ / ‖θ_anchor‖ ≤ trust_radius` (default 5%). In LoRA mode the
+bound is applied to the effective weight delta `BA·(α/r)` relative to the
+frozen base matrix.
+
+The anchor moves at each consolidation, so this bounds how far the model can
+go *between* consolidations — every 32 updates by default — not over its whole
+life. A long conversation, or a big upload, can carry it further one bounded
+stretch at a time; what bounds the total is the canary below, which refuses to
+consolidate, and rolls back, once general English starts to suffer.
 
 ### 5. A canary and automatic rollback — undo learning that made it worse
 
@@ -300,7 +401,10 @@ aria pretrain --preset {tiny,small,base} [--steps N] [--max-minutes M]
 aria serve [--port 8000] [--no-browser]          # browser UI
 aria chat [--verbose] [--no-learn] [--learner-plasticity full]
 aria sample --prompt "The " --state-dir runs/aria/online
-aria teach notes.txt          # learn from a document, paragraph by paragraph
+aria serve --blank            # a model with no pretraining (see above)
+aria blank [--size small]     # create one explicitly
+aria teach notes.txt more.docx         # learn from documents
+aria teach chat.txt --speaker Jo       # learn to answer like Jo
 aria status                   # what the learner has been doing
 ```
 
@@ -310,6 +414,7 @@ Inside `chat`:
 /status        learner and memory statistics
 /memory [n]    recent remembered exchanges
 /teach <text>  learn from a passage directly
+/upload <file> [as <name>]   learn from a whole document or transcript
 /correct <text>  replace Aria's last reply with yours and learn from it (weight 3x, bypasses the gate)
 /consolidate   force a consolidation pass
 /learn on|off  toggle online learning
@@ -401,7 +506,10 @@ importantly — each continual-learning safeguard individually: that the trust
 region really caps drift, that rollback really restores weights, that
 consolidation really moves knowledge into the base matrices, that rehearsal
 really protects an old lesson from being erased by forty new ones, and that
-the canary is never trained on.
+the canary is never trained on. Uploads have their own tests (every format,
+transcript parsing, that a transcript trains only the chosen voice, that a
+blank model learns from a sample), and so does the server's refusal of
+requests from other sites.
 
 ---
 
@@ -419,8 +527,14 @@ the canary is never trained on.
 - **Learning from a single user is a narrow distribution.** The safeguards bound
   the drift; they do not make it neutral. Over thousands of turns Aria will
   become specifically adapted to how *you* write.
-- **Anything you type may end up in the weights and on disk** in
-  `runs/aria/online/`. Use `--no-learn` for anything you would not want stored.
+- **Anything you type or upload may end up in the weights and on disk** in the
+  checkpoint's `online/` directory. Use `--no-learn` for anything you would not
+  want stored. A model that has learned someone's voice can reproduce their
+  writing, sometimes verbatim — treat `learned.pt` as you would the documents
+  you taught it.
+- **A blank model is a mimic.** Starting from nothing, it needs a great deal of
+  text before it says anything coherent, and what it says recombines its
+  sources. See [Start blank](#start-blank-no-pretraining-at-all).
 - **CPU only by default.** `--device cuda` works, but the presets are sized for
   a CPU budget.
 
@@ -435,12 +549,13 @@ aria/
   pretrain.py    offline training loop + Fisher estimation
   learner.py     the online learning engine
   memory.py      replay buffer and decision journal
+  documents.py   reading uploads: txt/md/docx/srt/vtt/pdf, transcripts
   sample.py      generation
   chat.py        REPL
   serve.py       local browser UI (standard library only)
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
-tests/           93 tests
+tests/           151 tests
 notebooks/       Colab notebook for a free GPU
 scripts/demo_learning.py  measures whether the learning actually works
 ```

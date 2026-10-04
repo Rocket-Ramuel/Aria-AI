@@ -192,4 +192,34 @@ def test_teach_command_learns_from_a_file(workspace, tmp_path, capsys):
                "--state-dir", str(root / "teach_state"), "--data-dir", str(data)])
     assert rc == 0
     assert (root / "teach_state" / "learned.pt").exists()
-    assert "[1/2]" in capsys.readouterr().out
+    assert "learned notes.txt" in capsys.readouterr().out
+
+
+def test_status_reads_the_state_dir_chat_writes_to(workspace, capsys):
+    """`status` used to default to runs/aria/online while chat wrote next to
+    the checkpoint, so it reported nothing for the shipped model."""
+    root, data, out = workspace
+    session = ChatSession(checkpoint=out / "base.pt", data_dir=data, max_new_tokens=4)
+    session.turn("hello there")
+    session.save()
+    assert session.state_dir == out / "online"
+    assert main(["status", "--checkpoint", str(out / "base.pt")]) == 0
+    import json as _json
+    report = _json.loads(capsys.readouterr().out)
+    assert report["state_dir"] == str(out / "online")
+    assert report["replay_size"] >= 1
+
+
+def test_resuming_with_a_different_model_shape_explains_itself(workspace):
+    root, data, out = workspace
+    with pytest.raises(ValueError, match="different model shape"):
+        main(["pretrain", "--data-dir", str(data), "--out-dir", str(out),
+              "--preset", "small", "--block-size", "64", "--steps", "2"])
+
+
+def test_blank_command_creates_a_model(tmp_path, capsys):
+    out = tmp_path / "b" / "base.pt"
+    assert main(["blank", "--out", str(out), "--size", "tiny"]) == 0
+    assert out.exists()
+    assert main(["blank", "--out", str(out)]) == 1        # no silent overwrite
+    assert main(["blank", "--out", str(out), "--size", "tiny", "--force"]) == 0

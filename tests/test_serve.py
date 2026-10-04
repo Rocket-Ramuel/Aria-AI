@@ -160,3 +160,121 @@ def test_server_survives_a_sequence_of_requests(server):
     for msg in ["one", "two", "three"]:
         post(base, "/api/chat", {"message": msg})
     assert get(base, "/api/status")[0] == 200
+
+
+# --- refusing other sites ------------------------------------------------
+#
+# Anything that reaches /api/* is written into the model's weights, so the
+# server must not answer a page from another site. A cross-site form or
+# text/plain fetch needs no CORS preflight; a DNS-rebinding page arrives with
+# a foreign Host header.
+
+
+def raw(base, path, body=b"", headers=None, method="POST"):
+    req = urllib.request.Request(base + path, data=body if method == "POST" else None,
+                                 headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def test_text_plain_post_is_refused(server):
+    base, session = server
+    before = len(session.learner.replay)
+    code, _ = raw(base, "/api/command",
+                  json.dumps({"command": "/teach injected text from another site"}).encode(),
+                  {"Content-Type": "text/plain"})
+    assert code == 415
+    assert len(session.learner.replay) == before
+
+
+def test_foreign_origin_is_refused(server):
+    base, _ = server
+    code, body = raw(base, "/api/command", json.dumps({"command": "/status"}).encode(),
+                     {"Content-Type": "application/json",
+                      "Origin": "https://evil.example"})
+    assert code == 403 and "refused" in body
+    code, _ = raw(base, "/api/command", json.dumps({"command": "/status"}).encode(),
+                  {"Content-Type": "application/json", "Origin": "null"})
+    assert code == 403
+
+
+def test_foreign_host_is_refused_even_for_reads(server):
+    """DNS rebinding: the attacker's name resolves to 127.0.0.1, so the browser
+    lets their page read the response. The Host header gives it away."""
+    base, _ = server
+    code, _ = raw(base, "/api/command", json.dumps({"command": "/memory"}).encode(),
+                  {"Content-Type": "application/json", "Host": "attacker.example:8000"})
+    assert code == 403
+    code, _ = raw(base, "/api/status", headers={"Host": "attacker.example"}, method="GET")
+    assert code == 403
+
+
+def test_own_page_is_accepted(server):
+    base, _ = server
+    port = base.rsplit(":", 1)[1]
+    for host in (f"localhost:{port}", f"127.0.0.1:{port}"):
+        code, _ = raw(base, "/api/command", json.dumps({"command": "/status"}).encode(),
+                      {"Content-Type": "application/json", "Host": host,
+                       "Origin": f"http://{host}"})
+        assert code == 200, host
+
+
+def test_hostname_parsing():
+    from aria.serve import _hostname
+    assert _hostname("localhost:8000") == "localhost"
+    assert _hostname("LOCALHOST") == "localhost"
+    assert _hostname("[::1]:8000") == "::1"
+    assert _hostname("127.0.0.1") == "127.0.0.1"
+
+
+def test_malformed_json_is_a_400_not_a_crash(server):
+    base, _ = server
+    code, _ = raw(base, "/api/command", b"[1, 2]", {"Content-Type": "application/json"})
+    assert code == 400
+    assert get(base, "/api/status")[0] == 200
+
+
+# --- uploads -------------------------------------------------------------
+
+
+def upload(base, name, data, **extra):
+    import base64
+    return post(base, "/api/upload",
+                {"name": name, "data": base64.b64encode(data).decode(), **extra})
+
+
+def test_upload_streams_progress_then_a_summary(server):
+    base, session = server
+    before = session.learner.updates_applied
+    status, body = upload(base, "sample.txt", (CORPUS * 3).encode(), passes=1)
+    assert status == 200
+    events = sse_events(body)
+    assert any("progress" in e for e in events)
+    assert "learned sample.txt" in events[-1]["done"]
+    assert session.learner.updates_applied > before
+
+
+def test_upload_of_a_transcript_as_a_speaker(server):
+    base, _ = server
+    log = b"Sam: are you coming tonight\nJo: reckon I will, love\n" * 3
+    _, body = upload(base, "chat.txt", log, speaker="Jo", passes=1)
+    assert "replies by Jo" in sse_events(body)[-1]["done"]
+    _, body = upload(base, "chat.txt", log, speaker="Nobody", passes=1)
+    assert "speakers are" in sse_events(body)[-1]["error"]
+
+
+def test_bad_uploads_are_rejected_cleanly(server):
+    base, _ = server
+    with pytest.raises(urllib.error.HTTPError) as e:
+        post(base, "/api/upload", {"name": "x.txt", "data": "not base64!!"})
+    assert e.value.code == 400
+    _, body = upload(base, "song.mp3", b"\x00\x01\x02")
+    assert "can't read" in sse_events(body)[-1]["error"]
+    assert get(base, "/api/status")[0] == 200
+
+
+def test_page_offers_a_file_upload():
+    assert 'type="file"' in PAGE and ".docx" in PAGE and "/api/upload" in PAGE

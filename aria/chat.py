@@ -6,18 +6,21 @@ exchange to the online learner, which decides whether to take a gradient step.
 
 from __future__ import annotations
 
+import dataclasses
+import shlex
 import sys
 from pathlib import Path
-from typing import Sequence
-
-import torch
+from typing import Any
 
 from .config import LearnerConfig
 from .data import TokenStream
-from .learner import OnlineLearner, resume_learned_weights
-from .memory import Journal
-from .pretrain import load_checkpoint, resolve_checkpoint
+from .documents import (extract_text, parse_transcript, speakers,
+                        strip_speaker_labels, transcript_dialogues)
+from .learner import OnlineLearner, Progress, UpdateReport, resume_learned_weights
+from .pretrain import (BLANK_CHECKPOINT, create_blank_checkpoint, load_checkpoint,
+                       resolve_checkpoint)
 from .sample import build_chat_prompt, generate
+from .tokenizer import BPETokenizer
 
 HELP = """
 commands:
@@ -25,6 +28,9 @@ commands:
   /status                learner and memory statistics
   /memory [n]            show the n most recent remembered exchanges
   /teach <text>          learn from a passage directly (no reply generated)
+  /upload <file> [as <name>]
+                         learn from a whole document (.txt .md .docx .srt .vtt .pdf);
+                         for a transcript, "as <name>" makes Aria answer like <name>
   /correct <text>        replace Aria's last reply with <text> and learn from it
   /learn on|off          enable or disable online learning
   /verbose on|off        show the learner's per-turn diagnostics
@@ -37,6 +43,37 @@ commands:
 """.strip()
 
 
+def default_state_dir(checkpoint: str | Path) -> Path:
+    """Where a checkpoint's learned weights and memories live by default.
+
+    Next to the checkpoint, so two different base models never share (and
+    corrupt) one memory. Every command that touches learner state resolves it
+    through here, so they all agree on where to look."""
+    return Path(checkpoint).parent / "online"
+
+
+def resolve_session_checkpoint(checkpoint: str | Path | None, blank: bool) -> Path:
+    if blank and not checkpoint:
+        if not BLANK_CHECKPOINT.exists():
+            create_blank_checkpoint(BLANK_CHECKPOINT)
+            print(f"created a blank model at {BLANK_CHECKPOINT}: it knows no "
+                  f"words yet, so teach it with /upload or `aria teach`.")
+        return BLANK_CHECKPOINT
+    return resolve_checkpoint(checkpoint)
+
+
+def _matching_corpus(data_dir: Path, tok: BPETokenizer, block_size: int):
+    """The pretraining stream for rehearsal, only if it was encoded with this
+    model's tokenizer — token ids from a different vocabulary are noise at
+    best and an index error at worst."""
+    train_bin, tok_json = data_dir / "train.bin", data_dir / "tokenizer.json"
+    if not (train_bin.exists() and tok_json.exists()):
+        return None
+    if [tuple(m) for m in BPETokenizer.load(tok_json).merges] != tok.merges:
+        return None
+    return TokenStream(train_bin, block_size)
+
+
 class ChatSession:
     def __init__(
         self,
@@ -47,31 +84,38 @@ class ChatSession:
         device: str = "cpu",
         learning: bool = True,
         verbose: bool = False,
-        max_new_tokens: int = 96,
+        max_new_tokens: int | None = None,
         temperature: float = 0.85,
         top_k: int = 40,
         top_p: float = 0.92,
+        learner_overrides: dict[str, Any] | None = None,
+        blank: bool = False,
     ) -> None:
-        checkpoint = resolve_checkpoint(checkpoint)
-        self.state_dir = Path(state_dir or checkpoint.parent / "online")
+        checkpoint = resolve_session_checkpoint(checkpoint, blank)
+        self.checkpoint = checkpoint
+        self.state_dir = Path(state_dir or default_state_dir(checkpoint))
         self.device = device
         self.learning = learning
         self.verbose = verbose
-        self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
 
         self.model, self.tok, self.cfg, ckpt = load_checkpoint(checkpoint, device)
+        # A byte-level model spends several tokens per word.
+        self.max_new_tokens = max_new_tokens or (96 if self.tok.merges else 240)
         restored = resume_learned_weights(self.model, self.state_dir, device)
 
+        # Command-line overrides apply on top of the config the checkpoint
+        # carries, so a blank model keeps its blank-model learner settings.
+        cfg = learner_cfg or dataclasses.replace(self.cfg.learner,
+                                                 **(learner_overrides or {}))
         stream = None
-        train_bin = Path(data_dir) / "train.bin"
-        if train_bin.exists():
-            stream = TokenStream(train_bin, self.model.cfg.block_size)
+        if cfg.pretrain_replay_frac > 0:
+            stream = _matching_corpus(Path(data_dir), self.tok, self.model.cfg.block_size)
 
         self.learner = OnlineLearner(
-            self.model, self.tok, learner_cfg or self.cfg.learner,
+            self.model, self.tok, cfg,
             fisher=ckpt.get("fisher"), pretrain_stream=stream,
             state_dir=self.state_dir, device=device,
         )
@@ -84,6 +128,7 @@ class ChatSession:
         prompt = build_chat_prompt(self.tok, self.history, user_message,
                                    self.model.cfg.block_size)
         pieces: list[int] = []
+        decoder = self.tok.stream_decoder()
         for tid in generate(
             self.model, prompt,
             max_new_tokens=self.max_new_tokens,
@@ -95,8 +140,10 @@ class ChatSession:
         ):
             pieces.append(tid)
             if stream_to is not None:
-                stream_to.write(self.tok.decode([tid], skip_special=True))
+                stream_to.write(decoder.feed(tid))
                 stream_to.flush()
+        if stream_to is not None:
+            stream_to.write(decoder.flush())
         return self.tok.decode(pieces, skip_special=True).strip()
 
     def turn(self, user_message: str, stream_to=None):
@@ -128,6 +175,45 @@ class ChatSession:
         self.history[-1] = ("aria", corrected_reply)
         return self.learner.observe(self._recent_turns(), weight=3.0,
                                     kind="correction", force=True)
+
+    def upload(
+        self,
+        name: str,
+        data: bytes,
+        speaker: str | None = None,
+        passes: int | None = None,
+        weight: float = 1.0,
+        progress: Progress = None,
+    ) -> tuple[UpdateReport, str]:
+        """Learn from a whole file. Returns the report and a one-line summary.
+
+        A transcript with `speaker` named is learned as conversations in which
+        that person plays Aria. Anything else is learned as prose in Aria's
+        voice — for a transcript, with the speaker labels taken out so she
+        learns the speech and not the formatting."""
+        text = extract_text(name, data)
+        turns = parse_transcript(text)
+        if turns and speaker:
+            names = speakers(turns)
+            if not any(speaker.casefold() == n.casefold() for n in names):
+                raise ValueError(f"nobody called {speaker!r} speaks in {name}; "
+                                 f"speakers are: {', '.join(names[:8])}")
+            convos = transcript_dialogues(turns, speaker)
+            report = self.learner.learn_dialogues(convos, passes=passes, weight=weight,
+                                                  name=name, progress=progress)
+            what = f"{len(convos)} replies by {speaker}"
+        else:
+            if turns:
+                text = strip_speaker_labels(turns)
+            report = self.learner.learn_document(text, passes=passes, weight=weight,
+                                                 name=name, progress=progress)
+            what = f"{len(text.split())} words"
+            if turns:
+                what += (f" (a transcript: name a speaker to learn how one person "
+                         f"replies — speakers: {', '.join(speakers(turns)[:5])})")
+        # Learned material should survive a crash as surely as a chat turn.
+        self.save()
+        return report, f"learned {name}: {what}"
 
     def save(self) -> None:
         self.learner.save()
@@ -200,6 +286,26 @@ def _command(session: ChatSession, line: str) -> bool:
             print("  usage: /teach <text>")
         else:
             print(" ", session.learner.observe_text(arg, weight=2.0).line())
+    elif cmd == "/upload":
+        try:
+            words = shlex.split(arg)
+        except ValueError as e:
+            words = []
+            print(f"  {e}")
+        speaker = None
+        if len(words) >= 3 and words[-2].lower() == "as":
+            speaker, words = words[-1], words[:-2]
+        if len(words) != 1:
+            print("  usage: /upload <file> [as <speaker name>]")
+        else:
+            path = Path(words[0]).expanduser()
+            try:
+                report, summary = session.upload(
+                    path.name, path.read_bytes(), speaker=speaker,
+                    progress=_print_progress)
+                print(f"  {summary}\n  {report.line()}")
+            except (OSError, ValueError) as e:
+                print(f"  can't learn from {path}: {e}")
     elif cmd == "/correct":
         if not arg:
             print("  usage: /correct <what Aria should have said>")
@@ -234,3 +340,8 @@ def _command(session: ChatSession, line: str) -> bool:
     else:
         print(f"  unknown command {cmd}; try /help")
     return False
+
+
+def _print_progress(step: int, total: int, lr: float) -> None:
+    print(f"\r  learning ... step {step}/{total}", end="\n" if step == total else "",
+          flush=True)

@@ -101,10 +101,30 @@ class LearnerConfig:
     pretrain_replay_frac: float = 0.5   # of those, share drawn from the pretrain corpus
     replay_capacity: int = 4096    # reservoir size for conversational memories
 
+    # --- whose words are learned -------------------------------------------
+    # The user's own messages are also learned as if Aria had said them, so
+    # her replies drift toward how the person she talks to writes.
+    style_mirror: bool = True
+    style_weight: float = 0.5      # relative weight of the user's words vs. the reply
+    # Training on Aria's own sampled reply mostly reinforces what she already
+    # says. Harmless for a pretrained model; for a blank one it would teach her
+    # her own babble, so the blank preset turns it off.
+    learn_own_replies: bool = True
+
+    # --- uploaded documents --------------------------------------------------
+    document_passes: int = 3       # epochs over an uploaded document
+    document_batch: int = 4        # document windows per gradient step
+    document_min_steps: int = 24   # a short sample still gets a real lesson
+    document_max_steps: int = 400  # cap per upload, so a book doesn't take all night
+    # An upload is deliberate material, so it moves faster than chat. Measured
+    # on the shipped model: 3x cuts loss on a 200-word sample from 6.4 to about 4
+    # with the canary unchanged; 10x starts to cost general English.
+    document_lr_scale: float = 3.0
+
     # --- regularisation toward the anchor ----------------------------------
     ewc_lambda: float = 250.0      # weight on Fisher-weighted pull to the anchor
     l2_anchor: float = 1e-3        # plain L2 pull to the anchor (backstop if no Fisher)
-    trust_radius: float = 0.05     # max ||theta - anchor|| / ||anchor|| per tensor
+    trust_radius: float = 0.05     # max ||theta - anchor|| / ||anchor|| per tensor; 0 = off
 
     # --- surprise gating ---------------------------------------------------
     # Learn from what is novel, ignore what the model already predicts well.
@@ -116,6 +136,10 @@ class LearnerConfig:
     max_lr_scale: float = 3.0
 
     # --- safety net --------------------------------------------------------
+    # The canary measures loss on general English. That is the right guard for
+    # a pretrained model and the wrong one for a blank model learning one
+    # person's idiolect, where drifting away from "general English" is the goal.
+    health_check: bool = True
     health_interval: int = 8       # run the canary eval every N applied updates
     health_tolerance: float = 0.06  # allowed relative rise in canary loss
     health_patience: int = 2       # consecutive failures before rollback
@@ -172,3 +196,33 @@ def preset(name: str) -> ModelConfig:
     if name not in PRESETS:
         raise KeyError(f"unknown preset {name!r}; choose from {sorted(PRESETS)}")
     return dataclasses.replace(PRESETS[name])
+
+
+def blank_learner_config() -> LearnerConfig:
+    """Learner settings for a model that starts from random weights.
+
+    Every safeguard in the default config protects knowledge the model already
+    has. A blank model has none, so the anchors, trust region, EWC, canary and
+    corpus rehearsal would only stop it from learning. What remains is
+    rehearsal of the user's own past words, which is what keeps one session
+    from overwriting the last.
+    """
+    return LearnerConfig(
+        plasticity="full",
+        learning_rate=1e-3,
+        steps_per_turn=2,
+        replay_batch=4,
+        pretrain_replay_frac=0.0,
+        style_mirror=True,
+        style_weight=1.0,
+        learn_own_replies=False,
+        document_passes=4,
+        document_batch=8,
+        document_lr_scale=1.0,
+        document_max_steps=600,
+        ewc_lambda=0.0,
+        l2_anchor=0.0,
+        trust_radius=0.0,
+        surprise_gate=False,
+        health_check=False,
+    )
