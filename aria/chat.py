@@ -102,7 +102,7 @@ class ChatSession:
         state_dir: str | Path | None = None,
         data_dir: str | Path = "data",
         learner_cfg: LearnerConfig | None = None,
-        device: str = "cpu",
+        device: str = "auto",
         learning: bool = True,
         verbose: bool = False,
         max_new_tokens: int | None = None,
@@ -112,6 +112,8 @@ class ChatSession:
         learner_overrides: dict[str, Any] | None = None,
         blank: bool = False,
     ) -> None:
+        from .device import resolve
+        device = resolve(device)
         checkpoint = resolve_session_checkpoint(checkpoint, blank)
         self.checkpoint = checkpoint
         self.state_dir = Path(state_dir or default_state_dir(checkpoint))

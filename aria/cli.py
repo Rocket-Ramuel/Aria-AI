@@ -179,6 +179,8 @@ def _cmd_sample(args) -> int:
     from .pretrain import load_checkpoint, resolve_checkpoint
     from .sample import complete
     torch.set_num_threads(args.threads)
+    from .device import resolve
+    args.device = resolve(args.device)
     model, tok, _, _ = load_checkpoint(resolve_checkpoint(args.checkpoint), args.device)
     from .learner import resume_learned_weights
     if args.state_dir:
@@ -269,6 +271,9 @@ def _cmd_blank(args) -> int:
     return 0
 
 
+DEVICES = ["auto", "cpu", "cuda", "mps"]
+DEVICE_HELP = ("where to run: auto (default) picks an NVIDIA GPU (cuda), then an "
+               "Apple Silicon GPU (mps), then the CPU")
 BLANK_HELP = ("use a model with no pretraining (created at runs/blank/base.pt "
               "if needed) that learns only from what you upload and say")
 
@@ -316,7 +321,8 @@ def build_parser() -> argparse.ArgumentParser:
     pt.add_argument("--chat-frac", type=float, default=0.25,
                     help="fraction of each batch drawn from chat-format examples")
     pt.add_argument("--no-resume", action="store_true")
-    pt.add_argument("--device", default="cpu")
+    pt.add_argument("--device", default="auto", choices=DEVICES,
+                    help=DEVICE_HELP)
     pt.set_defaults(func=_cmd_pretrain)
 
     ch = sub.add_parser("chat", parents=[common], help="talk to Aria; she learns as you do")
@@ -325,7 +331,8 @@ def build_parser() -> argparse.ArgumentParser:
     ch.add_argument("--state-dir", default=None,
                     help="where learned weights and memory live (default <ckpt dir>/online)")
     ch.add_argument("--data-dir", default="data")
-    ch.add_argument("--device", default="cpu")
+    ch.add_argument("--device", default="auto", choices=DEVICES,
+                    help=DEVICE_HELP)
     ch.add_argument("--no-learn", action="store_true", help="talk without updating weights")
     ch.add_argument("--verbose", action="store_true", help="print learner diagnostics each turn")
     ch.add_argument("--blank", action="store_true", help=BLANK_HELP)
@@ -352,7 +359,8 @@ def build_parser() -> argparse.ArgumentParser:
     qs.add_argument("--no-browser", action="store_true")
     qs.add_argument("--host", default="127.0.0.1")
     qs.add_argument("--port", type=int, default=8000)
-    qs.add_argument("--device", default="cpu")
+    qs.add_argument("--device", default="auto", choices=DEVICES,
+                    help=DEVICE_HELP)
     qs.set_defaults(func=_cmd_quickstart)
 
     sv = sub.add_parser("serve", parents=[common],
@@ -371,7 +379,8 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--blank", action="store_true", help=BLANK_HELP)
     sv.add_argument("--max-new-tokens", type=int, default=None)
     sv.add_argument("--temperature", type=float, default=0.85)
-    sv.add_argument("--device", default="cpu")
+    sv.add_argument("--device", default="auto", choices=DEVICES,
+                    help=DEVICE_HELP)
     _add_learner_flags(sv)
     sv.set_defaults(func=_cmd_serve)
 
@@ -382,7 +391,8 @@ def build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--prompt", default="The ")
     sm.add_argument("--max-new-tokens", type=int, default=120)
     sm.add_argument("--temperature", type=float, default=0.85)
-    sm.add_argument("--device", default="cpu")
+    sm.add_argument("--device", default="auto", choices=DEVICES,
+                    help=DEVICE_HELP)
     sm.set_defaults(func=_cmd_sample)
 
     ex = sub.add_parser("export", parents=[common],
@@ -425,7 +435,8 @@ def build_parser() -> argparse.ArgumentParser:
     te.add_argument("--blank", action="store_true", help=BLANK_HELP)
     te.add_argument("--state-dir", default=None)
     te.add_argument("--data-dir", default="data")
-    te.add_argument("--device", default="cpu")
+    te.add_argument("--device", default="auto", choices=DEVICES,
+                    help=DEVICE_HELP)
     te.add_argument("--weight", type=float, default=1.0)
     _add_learner_flags(te)
     te.set_defaults(func=_cmd_teach)

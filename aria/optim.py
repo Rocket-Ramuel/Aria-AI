@@ -57,7 +57,10 @@ class LowMemoryAdam:
                 g = g.float()
                 st = self.state.get(p)
                 if st is None:
-                    st = self.state[p] = {"t": 0, "m": torch.zeros_like(p, dtype=torch.bfloat16)}
+                    # bfloat16 on CPUs and NVIDIA GPUs; float32 on an Apple GPU,
+                    # where bfloat16 needs a recent macOS.
+                    m_dtype = torch.float32 if p.device.type == "mps" else torch.bfloat16
+                    st = self.state[p] = {"t": 0, "m": torch.zeros_like(p, dtype=m_dtype)}
                     if p.dim() >= 2:
                         st["row"] = torch.zeros(p.shape[:-1], dtype=torch.float32, device=p.device)
                         st["col"] = torch.zeros(p.shape[:-2] + p.shape[-1:],

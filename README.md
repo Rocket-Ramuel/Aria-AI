@@ -90,7 +90,8 @@ in the whole project is `prepare` downloading the public-domain corpus once.
 **Requirements:** Python 3.10+ and about 1.5 GB of free RAM (measured peak:
 0.85 GB for the pretrained model, 1.05 GB for a blank one, most of it PyTorch
 itself). Any laptop from the last
-decade will do. macOS, Linux and Windows all work; a GPU is optional.
+decade will do. macOS, Linux and Windows all work; a GPU is optional and
+[used automatically](#gpus-nvidia-and-apple-silicon) if you have one.
 
 ### Talk to her straight away
 
@@ -175,6 +176,42 @@ pipeline on Google Colab's free tier. A T4 trains the `small` preset in a few
 minutes and makes the ~100M-parameter `base` preset realistic. The last cell
 packages the trained weights so you can download them and carry on locally —
 talking to Aria needs no GPU, only training benefits from one.
+
+### GPUs: NVIDIA and Apple Silicon
+
+Every command takes `--device`, and the default, `auto`, picks for you:
+
+1. an **NVIDIA GPU** (`cuda`), if PyTorch was installed with CUDA support;
+2. the **GPU of an Apple Silicon Mac** (`mps`) — any M1, M2, M3 or M4 Mac,
+   including a MacBook Air;
+3. otherwise the **CPU**.
+
+`aria serve` prints which it chose ("running on the Apple GPU"). Before a GPU
+is trusted, Aria runs a short self-test on it — a tiny model doing everything
+she does: learning, the low-memory optimiser, cortical areas, sampling and
+memory recall. If anything fails (an operation your PyTorch version doesn't
+support on that GPU, say), she says so and runs on the CPU instead of
+crashing mid-conversation. On a Mac, PyTorch is also told to run any
+operation the Apple GPU lacks on the CPU instead of failing.
+
+**On a Mac:** install PyTorch normally (`pip install torch`; the Mac build
+includes Apple GPU support) and run `aria serve` as usual. Intel Macs have no
+supported GPU and use the CPU. Two things to know:
+
+- For chatting, the GPU isn't necessarily faster: Aria is small enough that
+  handing each word to the GPU and back can cost as much as it saves. It helps
+  most with big uploads. To compare on your machine, try `--device cpu` and
+  `--device mps` on the same upload.
+- A MacBook Air has no fan. Under a long upload — on the GPU or the CPU — it
+  slows itself down to stay cool, which is normal and harmless but caps how
+  fast big jobs go. Plug in for big uploads; they use the battery heavily.
+
+**Tested:** the device selection, the self-test and the fallback are covered
+by the test suite (with GPUs simulated), and everything was measured on a CPU.
+Aria has **not yet been run on a real Apple GPU**. The parts known to differ
+on one were made safe (weights load through the CPU, the optimiser's momentum
+stays 32-bit there, 16-bit arithmetic is off there), and the self-test is the
+backstop. If something goes wrong on your Mac, the message says what.
 
 ### How slow is CPU, really?
 
@@ -269,7 +306,7 @@ Measured on four CPU cores:
 | blank | ~450 words/s | ~15 min (4 passes) |
 
 A 5-million-word archive is an overnight job on a laptop. It runs in the
-background and can be stopped any time; a GPU (`--device cuda`) is much
+background and can be stopped any time; a GPU ([see below](#gpus-nvidia-and-apple-silicon)) is much
 faster.
 
 ### Your own messages
@@ -781,7 +818,7 @@ requests from other sites.
 - **A blank model is a mimic.** Starting from nothing, it needs a great deal of
   text before it says anything coherent, and what it says recombines its
   sources. See [Start blank](#start-blank-no-pretraining-at-all).
-- **CPU only by default.** `--device cuda` works, but the presets are sized for
+- **Sized for a CPU.** A GPU is used automatically when present, but the presets are sized for
   a CPU budget.
 
 ## Layout
@@ -797,6 +834,7 @@ aria/
   memory.py      replay buffer and decision journal (bounded)
   documents.py   streaming readers for uploads: txt/md/docx/srt/vtt/pdf, transcripts
   storage.py     compact, atomic weight files (float16, int8, log-encoded Fisher)
+  device.py      choosing NVIDIA GPU / Apple GPU / CPU, with a self-test
   hippocampus.py fast, one-shot episodic memory
   optim.py       a low-memory Adam for large models
   sample.py      generation
@@ -804,7 +842,7 @@ aria/
   serve.py       local browser UI and background learning (standard library only)
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
-tests/           203 tests
+tests/           213 tests
 notebooks/       Colab notebook for a free GPU
 scripts/demo_learning.py     measures whether the learning actually works
 scripts/recompute_fisher.py  re-estimates a checkpoint's Fisher information

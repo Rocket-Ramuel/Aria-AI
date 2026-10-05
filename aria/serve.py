@@ -1002,6 +1002,8 @@ def serve(
 
     url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
     print(f"Aria is running at {url}")
+    from .device import describe
+    print(f"  running on the {describe(session.device)}")
     print(f"  model      {slots[active]['label']}, "
           f"{session.model.num_params()/1e6:.2f}M parameters")
     print(f"  memory     {session.state_dir}")

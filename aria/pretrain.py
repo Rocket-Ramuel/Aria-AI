@@ -62,10 +62,11 @@ def build_optimizer(model: GPT, cfg: TrainConfig) -> torch.optim.AdamW:
 def evaluate(model: GPT, stream: TokenStream, batches: int, batch_size: int,
              generator: torch.Generator) -> float:
     model.eval()
+    device = next(model.parameters()).device
     total = 0.0
     for _ in range(batches):
         x, y = stream.batch(batch_size, generator)
-        _, loss, _ = model(x, y)
+        _, loss, _ = model(x.to(device), y.to(device))
         total += float(loss)
     model.train()
     return total / max(1, batches)
@@ -134,7 +135,7 @@ def load_checkpoint(path: str | Path, device: str = "cpu"):
     # tensors and plain containers, which the restricted loader handles.
     # mmap: weights are paged in from the file as they are copied into the
     # model, instead of being read into memory first — one copy, not two.
-    ckpt = torch.load(path, map_location=device, weights_only=True, mmap=True)
+    ckpt = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     cfg = AriaConfig.from_dict(ckpt["config"])
     tok = BPETokenizer(merges=[tuple(m) for m in ckpt["tokenizer"]["merges"]],
                        specials=ckpt["tokenizer"]["specials"])
@@ -223,9 +224,13 @@ def pretrain(
     train_cfg: TrainConfig | None = None,
     chat_frac: float = 0.25,
     resume: bool = True,
-    device: str = "cpu",
+    device: str = "auto",
     verbose: bool = True,
 ) -> Path:
+    from .device import describe, resolve
+    device = resolve(device)
+    if verbose:
+        print(f"training on the {describe(device)}", flush=True)
     data_dir, out_dir = Path(data_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -250,7 +255,7 @@ def pretrain(
     ckpt_path = out_dir / "base.pt"
     latest = out_dir / "latest.pt"
     if resume and latest.exists():
-        state = torch.load(latest, map_location=device, weights_only=True)
+        state = torch.load(latest, map_location="cpu", weights_only=True)
         saved = state.get("config", {}).get("model")
         if saved is not None and saved != dataclasses.asdict(model_cfg):
             diff = {k: (saved.get(k), v) for k, v in dataclasses.asdict(model_cfg).items()

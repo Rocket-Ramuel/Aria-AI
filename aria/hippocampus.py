@@ -209,8 +209,10 @@ class Hippocampus:
                 scored.append((score, eid))
         scored.sort(reverse=True)
         chosen = [eid for _, eid in scored[: self.episodes_considered]]
-        self.focus_mask = torch.isin(self.owner, torch.tensor(chosen, dtype=torch.long,
-                                                              device=self.device))
+        # On the CPU: torch.isin isn't implemented for Apple GPUs in every
+        # PyTorch version, and this runs once per reply.
+        self.focus_mask = torch.isin(self.owner.cpu(),
+                                     torch.tensor(chosen, dtype=torch.long)).to(self.device)
         return [(sc, self.episodes[eid]) for sc, eid in scored[: self.episodes_considered]]
 
     @torch.no_grad()

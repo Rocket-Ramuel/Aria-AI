@@ -1109,7 +1109,9 @@ class OnlineLearner:
             # so an interrupted save can't destroy what was learned.
             atomic_save(
                 {
-                    "model": half_state_dict(merged_state_dict(self.model)),
+                    # On the CPU, so the file loads on any machine.
+                    "model": {k: v.cpu() for k, v in
+                              half_state_dict(merged_state_dict(self.model)).items()},
                     # Growth adds layers; the base checkpoint doesn't know.
                     "n_layer": self.model.cfg.n_layer,
                     "updates_applied": self.updates_applied,
@@ -1166,7 +1168,9 @@ def resume_learned_weights(model: GPT, state_dir: str | Path,
     if not p.exists():
         return False
     # mmap: the file is paged in as needed, not copied whole into memory.
-    state = torch.load(p, map_location=device, weights_only=True, mmap=True)
+    # Read to the CPU (memory-mapped) and let load_state_dict copy onto the
+    # device: mmap straight onto a GPU isn't supported everywhere (Apple's).
+    state = torch.load(p, map_location="cpu", weights_only=True, mmap=True)
     grown_to = state.get("n_layer", model.cfg.n_layer)
     if grown_to > model.cfg.n_layer:
         # She grew in an earlier session: give the base model the same
@@ -1188,6 +1192,10 @@ def bf16_supported(device: str) -> bool:
     try:
         if str(device).startswith("cuda"):
             return torch.cuda.is_bf16_supported()
+        if str(device).startswith("mps"):
+            # Metal's bfloat16 depends on the macOS version and is not
+            # reliably faster; an Apple GPU stays in float32.
+            return False
         return bool(torch.ops.mkldnn._is_mkldnn_bf16_supported())
     except (AttributeError, RuntimeError):
         return False
