@@ -43,6 +43,7 @@ def generate(
     no_repeat_window: int = 64,
     stop_ids: Sequence[int] = (),
     device: torch.device | str = "cpu",
+    memory=None,
 ) -> Iterator[int]:
     """Yield generated token ids one at a time.
 
@@ -55,15 +56,27 @@ def generate(
     if not ids:
         raise ValueError("prompt is empty")
 
+    # `memory` is a Hippocampus: it recalls the episodes this conversation is
+    # about, then blends what came next in them into each prediction.
+    if memory is not None:
+        memory.focus(ids[-64:])
+
+    def forward(inp, caches):
+        if memory is None:
+            logits, _, caches = model(inp, kv_caches=caches)
+            return logits[:, -1, :].float(), caches
+        logits, _, caches, hidden = model(inp, kv_caches=caches, return_hidden=True)
+        return memory.recall(hidden[0, -1:], logits[0, -1:]), caches
+
     x = torch.tensor([ids], dtype=torch.long, device=device)
     caches = model.empty_cache()
-    logits, _, caches = model(x, kv_caches=caches)
+    step, caches = forward(x, caches)
 
     generated: list[int] = []
     stop = set(stop_ids)
 
     for _ in range(max_new_tokens):
-        step_logits = logits[:, -1, :].float()   # float32 even under bfloat16 autocast
+        step_logits = step.clone()   # float32, even under bfloat16 autocast
 
         if repetition_penalty != 1.0:
             recent = (ids + generated)[-no_repeat_window:]
@@ -89,11 +102,11 @@ def generate(
             generated = []
             caches = model.empty_cache()
             x = torch.tensor([ids], dtype=torch.long, device=device)
-            logits, _, caches = model(x, kv_caches=caches)
+            step, caches = forward(x, caches)
             continue
 
         x = torch.tensor([[nxt]], dtype=torch.long, device=device)
-        logits, _, caches = model(x, kv_caches=caches)
+        step, caches = forward(x, caches)
 
 
 def complete(

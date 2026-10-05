@@ -356,7 +356,8 @@ BLANK_CHECKPOINT = Path("runs/blank/base.pt")
 
 def create_blank_checkpoint(path: str | Path = BLANK_CHECKPOINT,
                             size: str = "small", block_size: int = 512,
-                            seed: int = 1337) -> Path:
+                            seed: int = 1337, areas: int = 0,
+                            area_scale: float = 1.0) -> Path:
     """A model that knows nothing: random weights, no vocabulary, no grammar.
 
     The tokenizer has no merges, so it reads raw bytes — any language, any
@@ -374,6 +375,7 @@ def create_blank_checkpoint(path: str | Path = BLANK_CHECKPOINT,
     model_cfg.vocab_size = tok.vocab_size
     # Bytes are short tokens; a longer window keeps a sentence or two in view.
     model_cfg.block_size = block_size
+    model_cfg.n_areas, model_cfg.area_scale = areas, area_scale
     cfg = AriaConfig(model=model_cfg, learner=blank_learner_config())
     torch.manual_seed(seed)
     model = GPT(model_cfg)

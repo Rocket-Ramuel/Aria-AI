@@ -323,6 +323,82 @@ much faster.
 
 ---
 
+## Aria's brain
+
+Aria is organised loosely like a brain: separate parts with separate jobs.
+None of this is a simulation of neurons; each part is an engineering
+mechanism chosen because it does the job its namesake does. `/brain` shows
+the map and what each part is doing.
+
+| part | in a brain | in Aria |
+| --- | --- | --- |
+| **cortex** | slow learning of general knowledge over many repetitions | the transformer's weights, changed a little by each exchange |
+| **hippocampus** | remembers an experience after one exposure; recalls it when something similar comes up | a fast memory of recent moments, used when she speaks (`aria/hippocampus.py`) |
+| **sleep** | replays the day's memories and makes them permanent | consolidation: learning folded into the weights, memories re-encoded |
+| **novelty** | dopamine marks surprising things as worth learning | the surprise gate: familiar exchanges are skipped, surprising ones learned harder |
+| **cortical areas** | regions specialise in different work | optional: each feed-forward layer split into specialist areas (below) |
+| **growth** | — | new layers added when she runs out of room |
+
+### The hippocampus: one-shot memory
+
+Her cortex learns slowly: one gradient step on "my dog is called Biscuit"
+barely changes anything. The hippocampus stores every exchange she hears as
+the cortex's internal state at each word, paired with the word that came
+next. When she speaks, it first recalls the *episodes* the conversation is
+about — matching its rarer words, as the brain uses context to cue a memory —
+and then, word by word, blends in what came next at the closest remembered
+moment. During sleep every memory is re-encoded, so memories keep matching as
+the cortex changes. It holds 16,384 words (`--learner-hippocampus-tokens`, 0
+to turn it off), about **8 MB**, and makes replies ~25% slower (46 → 58 ms).
+With `--verbose` (or in the page) you see what she recalled:
+`[recall] remembered "my dog is called Biscuit / ..." (match 0.73)`.
+
+Measured on the shipped model, told five facts once each, then asked about
+them. The number is the rank of the right word among her 8,192 possible next
+words, where the answer needs it:
+
+| | Biscuit | turquoise | carpenter | Priya | Wexford |
+| --- | --- | --- | --- | --- | --- |
+| no hippocampus | 147 | 5,524 | 543 | 3,926 | 2,405 |
+| one learning step per fact (the cortex alone) | 137 | 5,590 | 457 | 3,113 | 2,244 |
+| hippocampus | **1** | **2** | **1** | 29 | 2,216 |
+| hippocampus, among 1,000 unrelated memories | **1** | **2** | 546 | 1,539 | 2,406 |
+
+Loss on unrelated English was unchanged or slightly better throughout
+(4.62 → 4.51–4.66).
+
+**The honest limit:** the small model can't *use* a fact to answer a
+question, even with the fact sitting in its context window — asked "what is
+my dog called?" right after being told, it said "Biscuit" in 0 of 10 tries,
+with or without memory. The hippocampus makes the right word her top choice
+once she is answering in the right frame ("your dog is called …"), but the
+6.5M-parameter cortex rarely gets there by itself. Recall pays off as the
+cortex gets more capable — by growing, or with a larger model — and the
+mechanism doesn't need to change for that.
+
+### Cortical areas: specialists
+
+`aria blank --areas 4` builds a model whose feed-forward layers are split into
+four specialist areas, with a router (the thalamus's job) sending each word to
+the two it scores highest. Nobody tells the areas what to specialise in;
+`/brain` shows how unevenly the work ends up shared (in one run, one area of
+layer 4 took 53% of the words, another 14%).
+
+Measured learning the same 400 KB of text from blank for 400 steps:
+
+| | size | time | held-out loss |
+| --- | --- | --- | --- |
+| dense (the default) | 4.49M | 126 s | 1.795 |
+| 4 areas, same size (`--area-scale 1`) | 4.50M | 127 s | 1.900 (6% worse) |
+| 4 areas, twice as wide (`--area-scale 2`) | 7.74M (+72%) | 156 s (+23%) | 1.774 (1% better) |
+
+So at this scale areas make her more unusual, not smarter: the same-size
+version learns a little worse, and the better one costs 72% more size for 1%.
+That is why they are off by default. Mixture-of-experts layers like this pay
+off in much larger models trained on much more text.
+
+---
+
 ## How big does Aria get?
 
 **The same size, until she grows.** A neural network's size is fixed by its
@@ -538,7 +614,7 @@ exchanges:
 | check | what it asks | result |
 | --- | --- | --- |
 | **acquisition** | does teaching lower the loss on what was taught? | 6.68 → **2.5–2.6** (~62% lower) |
-| **retention** | does the lesson survive 40 unrelated new ones? | **0.82–0.91** — far below the untaught 6.68 |
+| **retention** | does the lesson survive 40 unrelated new ones? | **0.82–1.02** — far below the untaught 6.68 |
 | **stability** | is held-out English intact afterwards? | canary loss **+0.7% to +2.7%** across runs (tolerance 6%), 0 rollbacks |
 | **persistence** | does it survive a restart? | a bare `GPT` loading the half-precision `learned.pt` gets **0.82**, the same as before saving, vs base **6.68** |
 
@@ -570,6 +646,7 @@ aria blank [--size small]     # create one explicitly
 aria teach notes.txt more.docx         # learn from documents, any size
 aria teach chat.txt --speaker Jo       # learn to answer like Jo
 aria status [--blank]         # what the learner has been doing
+aria blank --areas 4          # a blank brain with specialist cortical areas
 aria export --with-learning --out my-aria.pt   # everything she knows, one file
 aria export --with-learning --int8 --out my-aria.pt   # the same at one byte per weight
 ```
@@ -584,6 +661,7 @@ Inside `chat`:
                              (or drag the file into the terminal)
 /correct <text>  replace Aria's last reply with yours and learn from it (weight 3x, bypasses the gate)
 /grow [n]      add n layers (default 1) without losing anything learned
+/brain         a map of her brain: cortex, areas, hippocampus, sleep, novelty
 /consolidate   force a consolidation pass
 /learn on|off  toggle online learning
 /save          write weights and memory to disk
@@ -684,10 +762,10 @@ requests from other sites.
 ## Limitations
 
 - **Scale.** See the framing at the top. This model confabulates constantly.
-- **Online learning is not memory.** A gradient step changes a *disposition*,
-  not a retrievable fact. Telling Aria your name once makes that reply more
-  likely; it does not create a lookup table. Facts you need reliably belong in
-  a retrieval layer, which this repo does not implement.
+- **Online learning is not memory, and memory is not understanding.** A
+  gradient step changes a *disposition*, not a retrievable fact. The
+  hippocampus does keep facts after one hearing, but the small cortex can
+  rarely turn a recalled fact into an answer ([details](#the-hippocampus-one-shot-memory)).
 - **The conversational register is memorised, not learned.** The base model
   recalls the seed dialogues closely and has little to say beyond them. Online
   learning changes dispositions on top of that; it does not substitute for a
@@ -712,20 +790,21 @@ requests from other sites.
 aria/
   config.py      dataclass configs and size presets
   tokenizer.py   byte-level BPE, trained from scratch
-  model.py       the transformer, KV cache, LoRA attach/merge, growth
+  model.py       the transformer, cortical areas, KV cache, LoRA attach/merge, growth
   data.py        corpus prep, chat formatting, batching
   pretrain.py    offline training loop + Fisher estimation
   learner.py     the online learning engine
   memory.py      replay buffer and decision journal (bounded)
   documents.py   streaming readers for uploads: txt/md/docx/srt/vtt/pdf, transcripts
   storage.py     compact, atomic weight files (float16, int8, log-encoded Fisher)
+  hippocampus.py fast, one-shot episodic memory
   optim.py       a low-memory Adam for large models
   sample.py      generation
   chat.py        REPL
   serve.py       local browser UI and background learning (standard library only)
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
-tests/           190 tests
+tests/           203 tests
 notebooks/       Colab notebook for a free GPU
 scripts/demo_learning.py     measures whether the learning actually works
 scripts/recompute_fisher.py  re-estimates a checkpoint's Fisher information

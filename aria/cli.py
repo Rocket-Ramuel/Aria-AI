@@ -261,7 +261,8 @@ def _cmd_blank(args) -> int:
         print(f"{out} already exists; pass --force to replace it "
               f"(its learned state in {out.parent / 'online'} is kept)")
         return 1
-    create_blank_checkpoint(out, size=args.size, block_size=args.block_size)
+    create_blank_checkpoint(out, size=args.size, block_size=args.block_size,
+                            areas=args.areas, area_scale=args.area_scale)
     print(f"wrote a blank {args.size} model to {out}. It knows no words yet:")
     print(f"  aria teach --checkpoint {out} some_writing.txt")
     print(f"  aria serve --checkpoint {out}")
@@ -435,6 +436,12 @@ def build_parser() -> argparse.ArgumentParser:
     bl.add_argument("--size", default="small", choices=["tiny", "small", "base"])
     bl.add_argument("--block-size", type=int, default=512,
                     help="context window in bytes")
+    bl.add_argument("--areas", type=int, default=0,
+                    help="split each feed-forward layer into this many specialist "
+                         "cortical areas, two used per word (0 = dense)")
+    bl.add_argument("--area-scale", type=float, default=1.0,
+                    help="1 = same size as dense; 2 = each word does dense-sized "
+                         "work, with twice the feed-forward parameters")
     bl.add_argument("--force", action="store_true")
     bl.set_defaults(func=_cmd_blank)
 

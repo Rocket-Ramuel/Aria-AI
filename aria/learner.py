@@ -65,6 +65,7 @@ import torch
 from .config import LearnerConfig
 from .data import TokenStream, collate, encode_dialogue, encode_dialogue_ids
 from .documents import iter_units
+from .hippocampus import Hippocampus
 from .memory import Journal, ReplayBuffer, canary_texts
 from .model import (GPT, IGNORE_INDEX, LoRALinear, attach_lora, block_index,
                     lora_parameters, merge_lora, merged_state_dict)
@@ -304,6 +305,16 @@ class OnlineLearner:
         self.prior_tokens = prior_tokens      # e.g. what pretraining used
 
         self._load_runtime_state()
+
+        # The fast memory system. Built from the replay buffer's text, encoded
+        # by the cortex as it is now (see aria.hippocampus).
+        self.hippocampus = None
+        if cfg.hippocampus_tokens > 0:
+            self.hippocampus = Hippocampus(
+                model, tok, capacity_tokens=cfg.hippocampus_tokens,
+                threshold=cfg.recall_threshold, strength=cfg.recall_strength,
+                device=device)
+            self.hippocampus.rebuild(self.replay.items)
 
     # ------------------------------------------------------------------
     # setup
@@ -689,6 +700,10 @@ class OnlineLearner:
         # Remember it regardless of whether we take a step: something
         # unremarkable now may still be worth rehearsing later.
         self.replay.add(turns, weight=weight, kind=kind)
+        # An episode is the moment itself — the latest exchange — not the
+        # whole context window it arrived in, which would put every recent
+        # fact into every memory.
+        self._remember(list(turns)[-2:], kind)
 
         gated_out = (
             self.cfg.surprise_gate
@@ -748,6 +763,7 @@ class OnlineLearner:
         if example is None:
             return UpdateReport(False, "too short", 0.0, 0.0, 0.0, self.lr)
         self.replay.add(["(document)", text], weight=weight, kind="document")
+        self._remember(["(document)", text], "document")
         loss_before = self.sequence_loss(example)
         if self.ema_loss is None:
             self.ema_loss = loss_before
@@ -804,6 +820,7 @@ class OnlineLearner:
                                              should_stop)
         for text in keep.items:
             self.replay.add(["(document)", text], weight=weight, kind="document")
+            self._remember(["(document)", text], "document")
         report.words = words[0]
         return report
 
@@ -833,6 +850,7 @@ class OnlineLearner:
                                              should_stop)
         for convo in keep.items:
             self.replay.add(convo, weight=weight, kind="transcript")
+            self._remember(convo, "transcript")
         return report
 
     def learn_document(self, text: str, passes: int | None = None, weight: float = 1.0,
@@ -988,12 +1006,23 @@ class OnlineLearner:
                 self.canary_baseline = canary
         return canary
 
+    def _remember(self, turns: Sequence[str], kind: str) -> None:
+        if self.hippocampus is not None:
+            self.hippocampus.store(turns, kind)
+
+    def sleep(self) -> None:
+        """Reconsolidation: re-encode every hippocampal memory with the
+        cortex as it is now, so memories keep matching as the cortex learns."""
+        if self.hippocampus is not None:
+            self.hippocampus.rebuild(self.replay.items)
+
     def rollback(self, canary: float) -> None:
         if not self.last_good:
             return
         self._restore(self.last_good)
         self.opt = self._new_optimizer(self.lr)
         self.lr *= self.cfg.rollback_lr_decay
+        self.sleep()
         self.journal.write(event="rollback", canary=canary,
                            baseline=self.canary_baseline, new_lr=self.lr)
 
@@ -1030,6 +1059,7 @@ class OnlineLearner:
         # Each rollback halved the learning rate; healthy consolidations win
         # it back, so a few bad turns can't leave her unable to learn forever.
         self.lr = min(self.cfg.learning_rate, self.lr * 1.5)
+        self.sleep()
         self.journal.write(event="consolidate", skipped=False, canary=canary,
                            baseline=self.canary_baseline,
                            updates=self.updates_applied)
@@ -1120,6 +1150,9 @@ class OnlineLearner:
             "tokens_learned": self.tokens_learned,
             "room_left": round(self.room_left(), 3),
             "memory_saver": self.saving_memory,
+            "hippocampus_memories": len(self.hippocampus.episodes) if self.hippocampus else 0,
+            "hippocampus_mb": round(self.hippocampus.memory_mb(), 2) if self.hippocampus else 0.0,
+            "recalls": self.hippocampus.recalls if self.hippocampus else 0,
         }
 
 

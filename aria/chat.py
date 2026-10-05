@@ -47,6 +47,7 @@ commands:
   /temp <float>          sampling temperature
   /consolidate           force a consolidation pass now
   /grow [n]              add n layers (default 1): more room to learn, kept knowledge
+  /brain                 a map of her brain: cortex, areas, hippocampus, sleep
   /forget                clear the replay buffer (weights are untouched)
   /save                  write learned weights and memory to disk
   /reset                 clear the current conversation context
@@ -163,6 +164,9 @@ class ChatSession:
                                    self.model.cfg.block_size)
         pieces: list[int] = []
         decoder = self.tok.stream_decoder()
+        memory = self.learner.hippocampus
+        if memory is not None:
+            memory.last_recall = None
         with self.learner.fast():
             for tid in generate(
                 self.model, prompt,
@@ -171,7 +175,7 @@ class ChatSession:
                 top_k=self.top_k,
                 top_p=self.top_p,
                 stop_ids=(self.tok.eot_id, self.tok.user_id, self.tok.bos_id),
-                device=self.device,
+                device=self.device, memory=memory,
             ):
                 pieces.append(tid)
                 if stream_to is not None:
@@ -179,7 +183,15 @@ class ChatSession:
                     stream_to.flush()
         if stream_to is not None:
             stream_to.write(decoder.flush())
+        # What the hippocampus contributed to this reply, if anything.
+        self.last_recall = memory.last_recall if memory is not None else None
         return self.tok.decode(pieces, skip_special=True).strip()
+
+    def recall_line(self) -> str | None:
+        if not getattr(self, "last_recall", None):
+            return None
+        sim, what = self.last_recall
+        return f"[recall] remembered \u201c{what}\u201d (match {sim:.2f})"
 
     def turn(self, user_message: str, stream_to=None):
         text = self.reply(user_message, stream_to=stream_to)
@@ -389,6 +401,8 @@ def run(session: ChatSession, banner: bool = True) -> None:
         print("aria> ", end="", flush=True)
         _, report = session.turn(line, stream_to=sys.stdout)
         print()
+        if session.verbose and session.recall_line():
+            print(session.recall_line())
         if report is not None and session.verbose:
             print(report.line())
         print()
@@ -513,6 +527,8 @@ def _command(session: ChatSession, line: str, interactive: bool = False) -> bool
             print(f"  temperature {session.temperature}")
         except ValueError:
             print("  usage: /temp 0.85")
+    elif cmd == "/brain":
+        print(brain_map(session))
     elif cmd == "/grow":
         n = int(arg) if arg.isdigit() and int(arg) > 0 else 1
         try:
@@ -525,7 +541,8 @@ def _command(session: ChatSession, line: str, interactive: bool = False) -> bool
     elif cmd == "/forget":
         session.learner.replay.items.clear()
         session.learner.replay.seen = 0
-        print("  replay buffer cleared (weights unchanged)")
+        session.learner.sleep()          # the hippocampus is built from it
+        print("  memories cleared (weights unchanged)")
     elif cmd == "/save":
         session.save()
         print(f"  saved to {session.state_dir}")
@@ -535,6 +552,36 @@ def _command(session: ChatSession, line: str, interactive: bool = False) -> bool
     else:
         print(f"  unknown command {cmd}; try /help")
     return False
+
+
+def brain_map(session: ChatSession) -> str:
+    """Each part of Aria's brain, what it does, and what it's doing now."""
+    from .model import Areas
+    L, m = session.learner, session.model
+    j = L.journal.summary()
+    out = [f"  cortex       {m.num_params() / 1e6:.2f}M weights in {m.cfg.n_layer} layers "
+           f"({session.base_layers} original) — slow, general knowledge; "
+           f"{100 * L.room_left():.0f}% room left"]
+    areas = [b.ffn for b in m.blocks if isinstance(b.ffn, Areas)]
+    if areas:
+        out.append(f"  areas        {len(areas[0].areas)} specialist areas per layer, "
+                   f"2 used per word; share of words each area has taken:")
+        for i, a in enumerate(areas):
+            total = float(a.usage.sum()) or 1.0
+            bars = "  ".join(f"{float(u) / total:4.0%}" for u in a.usage)
+            out.append(f"               layer {i + 1}: {bars}")
+    h = L.hippocampus
+    if h is not None:
+        out.append(f"  hippocampus  {len(h.episodes)} remembered moments ({len(h):,} words, "
+                   f"{h.memory_mb():.1f} MB) — one-shot memory; recalled "
+                   f"{h.recalls:,} times")
+    else:
+        out.append("  hippocampus  off")
+    out.append(f"  sleep        {j['consolidations']} consolidations, {j['rollbacks']} "
+               f"rollbacks — learning made permanent, memories re-encoded")
+    out.append(f"  novelty      {j['updates_skipped']} familiar exchanges skipped, "
+               f"{j['updates_applied']} learned — surprise decides what is worth learning")
+    return "\n".join(out)
 
 
 def _print_progress(p: LearnProgress) -> None:

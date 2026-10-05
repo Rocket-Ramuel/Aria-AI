@@ -123,10 +123,11 @@ class Attention(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, cfg: ModelConfig) -> None:
+    def __init__(self, cfg: ModelConfig, hidden: int | None = None) -> None:
         super().__init__()
-        hidden = int(cfg.ffn_mult * cfg.n_embd)
-        hidden = 32 * ((hidden + 31) // 32)   # round up for friendlier matmuls
+        if hidden is None:
+            hidden = int(cfg.ffn_mult * cfg.n_embd)
+            hidden = 32 * ((hidden + 31) // 32)   # round up for friendlier matmuls
         self.gate_proj = nn.Linear(cfg.n_embd, hidden, bias=False)
         self.up_proj = nn.Linear(cfg.n_embd, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, cfg.n_embd, bias=False)
@@ -136,13 +137,64 @@ class SwiGLU(nn.Module):
         return self.drop(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
+class Areas(nn.Module):
+    """Cortical areas: one feed-forward layer split into specialists.
+
+    A brain doesn't send every signal through all of its cortex; different
+    areas handle different things. Here the feed-forward layer is divided into
+    `n_areas` smaller networks, and a router — playing the thalamus — sends
+    each word to the two areas it scores highest, mixing their outputs. The
+    areas are not told what to specialise in; specialisation emerges from
+    learning, and `usage` records where words go.
+
+    The areas together have the same parameters as the dense layer they
+    replace, so the model is no bigger; each word uses only two of them, so
+    the feed-forward work per word is 2/n_areas of the dense layer's. A small
+    balancing term keeps the router from sending everything to one area.
+    """
+
+    TOP = 2
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        k = cfg.n_areas
+        dense = 32 * ((int(cfg.ffn_mult * cfg.n_embd) + 31) // 32)
+        self.router = nn.Linear(cfg.n_embd, k, bias=False)
+        # area_scale 1: together exactly the dense layer's width (same size,
+        # half the work per word). area_scale 2: each word does the dense
+        # layer's work, with twice the parameters to specialise in.
+        width = max(8, int(dense * cfg.area_scale) // k)
+        self.areas = nn.ModuleList(SwiGLU(cfg, hidden=width) for _ in range(k))
+        self.register_buffer("usage", torch.zeros(k), persistent=False)
+        self.balance: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        probs = F.softmax(self.router(flat).float(), dim=-1)
+        weight, chosen = probs.topk(self.TOP, dim=-1)
+        weight = (weight / weight.sum(-1, keepdim=True)).to(flat.dtype)
+        out = torch.zeros_like(flat)
+        for a, area in enumerate(self.areas):
+            rows, slot = (chosen == a).nonzero(as_tuple=True)
+            if rows.numel():
+                out.index_add_(0, rows, area(flat[rows]) * weight[rows, slot, None])
+        first = F.one_hot(chosen[:, 0], len(self.areas)).float()
+        if self.training:
+            # Switch-Transformer load balancing: fraction routed x mean prob.
+            self.balance = len(self.areas) * (first.mean(0) * probs.mean(0)).sum()
+        else:
+            self.usage += first.sum(0).detach()
+        return out.view(shape)
+
+
 class Block(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.attn_norm = RMSNorm(cfg.n_embd)
         self.attn = Attention(cfg)
         self.ffn_norm = RMSNorm(cfg.n_embd)
-        self.ffn = SwiGLU(cfg)
+        self.ffn = Areas(cfg) if cfg.n_areas > 1 else SwiGLU(cfg)
 
     def forward(self, x, cos, sin, kv_cache=None):
         h, new_cache = self.attn(self.attn_norm(x), cos, sin, kv_cache)
@@ -201,6 +253,7 @@ class GPT(nn.Module):
         targets: Optional[torch.Tensor] = None,
         kv_caches: Optional[list] = None,
         loss_reduction: str = "mean",
+        return_hidden: bool = False,
     ):
         """`targets` may contain IGNORE_INDEX at positions that should not
         contribute to the loss — that is how the chat format trains only on
@@ -232,6 +285,8 @@ class GPT(nn.Module):
         if targets is None:
             # Only the last position is needed to sample the next token.
             logits = self.lm_head(x[:, -1:, :])
+            if return_hidden:
+                return logits, None, new_caches, x
             return logits, None, new_caches
 
         logits = self.lm_head(x)
@@ -241,6 +296,12 @@ class GPT(nn.Module):
             ignore_index=IGNORE_INDEX,
             reduction=loss_reduction,
         )
+        if self.training and self.cfg.n_areas > 1 and loss_reduction == "mean":
+            balance = [b.ffn.balance for b in self.blocks if b.ffn.balance is not None]
+            if balance:
+                loss = loss + 0.01 * torch.stack(balance).mean()
+        if return_hidden:
+            return logits, loss, new_caches, x
         return logits, loss, new_caches
 
     def empty_cache(self) -> list[None]:
@@ -269,7 +330,9 @@ def grow(model: GPT, n_new: int) -> int:
         block = Block(model.cfg)
         block.apply(GPT._init_weights)
         nn.init.zeros_(block.attn.o_proj.weight)
-        nn.init.zeros_(block.ffn.down_proj.weight)
+        for name, sub in block.ffn.named_modules():
+            if name.endswith("down_proj"):
+                nn.init.zeros_(sub.weight)
         model.blocks.append(block.to(device))
     model.cfg.n_layer = len(model.blocks)
     return model.cfg.n_layer

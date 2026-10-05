@@ -36,6 +36,10 @@ class ModelConfig:
     rope_theta: float = 10000.0
     dropout: float = 0.0
     tie_embeddings: bool = True
+    # Cortical areas (aria.model.Areas): split each feed-forward layer into
+    # this many specialists, two used per word. 0 = one dense layer.
+    n_areas: int = 0
+    area_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.n_embd % self.n_head != 0:
@@ -160,6 +164,13 @@ class LearnerConfig:
     # /grow always works.
     tokens_per_param: float = 20.0
     grow_max_factor: float = 2.0
+
+    # --- hippocampus (aria.hippocampus) -----------------------------------
+    # Fast memory: words of recent experience kept for one-shot recall.
+    # 16,384 words is ~8 MB for the small model; 0 turns it off.
+    hippocampus_tokens: int = 16_384
+    recall_threshold: float = 0.35   # how closely a moment must match
+    recall_strength: float = 0.5     # most a memory can sway a prediction
 
     seed: int = 7
 

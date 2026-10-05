@@ -171,7 +171,8 @@ PAGE_TEMPLATE = """<!doctype html>
     and words in the background while you keep talking.
     Commands: <code>/status</code>, <code>/memory</code>,
     <code>/correct &lt;what Aria should have said&gt;</code>, <code>/teach &lt;text&gt;</code>,
-    <code>/grow</code> (add a layer), <code>/consolidate</code>, <code>/save</code>.
+    <code>/brain</code> (a map of her brain), <code>/grow</code> (add a layer),
+    <code>/consolidate</code>, <code>/save</code>.
   </div>
 </footer>
 
@@ -314,6 +315,8 @@ form.addEventListener('submit', async (e) => {
         target.appendChild(document.createTextNode(tok));
       }
       scroll();
+    } else if (ev.recall !== undefined) {
+      note(ev.recall);
     } else if (ev.learn !== undefined) {
       note(ev.learn);
     } else if (ev.error !== undefined) {
@@ -817,12 +820,15 @@ class _Handler(BaseHTTPRequestHandler):
                                            s.model.cfg.block_size)
                 pieces: list[int] = []
                 decoder = s.tok.stream_decoder()
+                memory = s.learner.hippocampus
+                if memory is not None:
+                    memory.last_recall = None
                 with s.learner.fast():
                     for tid in generate(
                         s.model, prompt, max_new_tokens=s.max_new_tokens,
                         temperature=s.temperature, top_k=s.top_k, top_p=s.top_p,
                         stop_ids=(s.tok.eot_id, s.tok.user_id, s.tok.bos_id),
-                        device=s.device,
+                        device=s.device, memory=memory,
                     ):
                         pieces.append(tid)
                         piece = decoder.feed(tid)
@@ -833,6 +839,9 @@ class _Handler(BaseHTTPRequestHandler):
                     self._event({"token": tail})
 
                 reply = s.tok.decode(pieces, skip_special=True).strip()
+                s.last_recall = memory.last_recall if memory is not None else None
+                if s.recall_line():
+                    self._event({"recall": s.recall_line()})
                 s.history.append(("user", message))
                 s.history.append(("aria", reply))
                 if learn:
