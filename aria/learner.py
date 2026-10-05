@@ -55,6 +55,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Sequence
@@ -65,12 +66,17 @@ from .config import LearnerConfig
 from .data import TokenStream, collate, encode_dialogue, encode_dialogue_ids
 from .documents import iter_units
 from .memory import Journal, ReplayBuffer, canary_texts
-from .model import (GPT, IGNORE_INDEX, LoRALinear, attach_lora, lora_parameters,
-                    merge_lora, merged_state_dict)
+from .model import (GPT, IGNORE_INDEX, LoRALinear, attach_lora, block_index,
+                    lora_parameters, merge_lora, merged_state_dict)
+from .optim import LowMemoryAdam
 from .storage import atomic_save, decode_fisher, dir_size_mb, half_state_dict
 from .tokenizer import BPETokenizer
 
 FFN_KEYS = ("gate_proj", "up_proj", "down_proj")
+
+# Above this many parameters, "auto" memory saving switches on: the low-memory
+# optimiser, activation checkpointing, and half-precision safety snapshots.
+MEMORY_SAVER_PARAMS = 20_000_000
 
 Example = tuple[list[int], list[int]]
 
@@ -236,8 +242,25 @@ class OnlineLearner:
         state_dir: str | Path = "runs/aria/online",
         device: str = "cpu",
         extra_canaries: Sequence[str] = (),
+        grown_from: int | None = None,
+        prior_tokens: int = 0,
     ) -> None:
         self.model = model
+        # Blocks at or above this index were added by growth. They start as
+        # exact no-ops, so they have nothing to protect: they are always fully
+        # trainable, outside LoRA, the anchors and the trust region.
+        self.grown_from = grown_from if grown_from is not None and \
+            grown_from < model.cfg.n_layer else None
+        mode = cfg.memory_saver
+        if mode not in ("auto", "on", "off"):
+            raise ValueError(f"memory_saver must be auto, on or off, not {mode!r}")
+        self.saving_memory = mode == "on" or (
+            mode == "auto" and model.num_params() > MEMORY_SAVER_PARAMS)
+        model.checkpointing = self.saving_memory
+        # bfloat16 arithmetic (weights stay float32): 2.4x faster learning on a
+        # CPU with native bfloat16 (measured, AMX), but slower on one without,
+        # so only where the hardware has it.
+        self.fast_math = self.saving_memory and bf16_supported(device)
         self.tok = tok
         self.cfg = cfg
         self.device = device
@@ -275,6 +298,10 @@ class OnlineLearner:
         # upload taking many steps can't jump over a scheduled consolidation.
         self.since_health = 0
         self.since_consolidation = 0
+        # Tokens the model has been trained on since it was created; how full
+        # it is getting, for growth (see `room_left`).
+        self.tokens_learned = 0
+        self.prior_tokens = prior_tokens      # e.g. what pretraining used
 
         self._load_runtime_state()
 
@@ -282,10 +309,24 @@ class OnlineLearner:
     # setup
     # ------------------------------------------------------------------
 
+    def fast(self):
+        """Context for the forward pass of learning and generation: bfloat16
+        arithmetic when `fast_math` is on, otherwise nothing. Evaluations that
+        the safety net compares (canary, losses in reports) stay float32."""
+        if not self.fast_math:
+            return nullcontext()
+        kind = "cuda" if str(self.device).startswith("cuda") else "cpu"
+        return torch.autocast(device_type=kind, dtype=torch.bfloat16)
+
+    def _is_grown(self, name: str) -> bool:
+        idx = block_index(name)
+        return self.grown_from is not None and idx is not None and idx >= self.grown_from
+
     def _configure_plasticity(self) -> None:
         mode = self.cfg.plasticity
         if mode == "lora":
-            n = attach_lora(self.model, self.cfg.lora_rank, self.cfg.lora_alpha)
+            n = attach_lora(self.model, self.cfg.lora_rank, self.cfg.lora_alpha,
+                            below_layer=self.grown_from)
             if n == 0:
                 raise RuntimeError("no LoRA targets found in model")
             for p in self.model.parameters():
@@ -300,6 +341,9 @@ class OnlineLearner:
                 p.requires_grad_(True)
         else:
             raise ValueError(f"unknown plasticity mode {mode!r}")
+        for name, p in self.model.named_parameters():
+            if self._is_grown(name):
+                p.requires_grad_(True)
         # New adapters are created on the CPU; every mode re-asserts the device
         # so a consolidation never leaves part of the model behind.
         self.model.to(self.device)
@@ -310,7 +354,10 @@ class OnlineLearner:
         if not self.trainable:
             raise RuntimeError(f"plasticity={mode!r} left no trainable parameters")
 
-    def _new_optimizer(self, lr: float) -> torch.optim.AdamW:
+    def _new_optimizer(self, lr: float):
+        if self.saving_memory:
+            return LowMemoryAdam(self.trainable, lr=lr,
+                                 betas=(self.cfg.beta1, self.cfg.beta2))
         return torch.optim.AdamW(
             self.trainable, lr=lr,
             betas=(self.cfg.beta1, self.cfg.beta2), weight_decay=0.0,
@@ -344,7 +391,12 @@ class OnlineLearner:
 
     def _snapshot(self) -> dict[str, torch.Tensor]:
         named = dict(self.model.named_parameters())
-        return {n: named[n].detach().clone() for n in self.trainable_names}
+        # In memory-saving mode the copies are half precision: a rollback
+        # then restores weights to within ~5e-4 relative, far inside what the
+        # canary can tell apart, for half the memory.
+        dtype = torch.float16 if self.saving_memory else None
+        return {n: named[n].detach().to(dtype=dtype, copy=True)
+                for n in self.trainable_names if not self._is_grown(n)}
 
     def _restore(self, snap: dict[str, torch.Tensor]) -> None:
         named = dict(self.model.named_parameters())
@@ -516,12 +568,14 @@ class OnlineLearner:
         for n in self.trainable_names:
             p = named[n]
             if self.cfg.plasticity == "lora":
+                if "lora_" not in n:
+                    continue      # a grown block: nothing to anchor to
                 # Anchor is the zero adapter: keep the correction small.
                 total = total + self.cfg.l2_anchor * p.pow(2).sum()
                 continue
             if n not in self.anchor:
                 continue
-            delta = p - self.anchor[n]
+            delta = p - self.anchor[n].to(p.dtype)
             total = total + self.cfg.l2_anchor * delta.pow(2).sum()
             f = self.fisher.get(n)
             if f is not None:
@@ -555,8 +609,10 @@ class OnlineLearner:
         if not self.anchor:
             return None
         for n in self.trainable_names:
+            if n not in self.anchor:
+                continue
             p = named[n]
-            a = self.anchor[n]
+            a = self.anchor[n].to(p.dtype)
             delta = p - a
             rel = float(delta.norm()) / (float(a.norm()) + 1e-12)
             if clip and rel > radius:
@@ -576,10 +632,15 @@ class OnlineLearner:
         self.model.train()
         x, y = self._batch(batch)
         self.opt.zero_grad(set_to_none=True)
-        _, ce, _ = self.model(x, y)
+        with self.fast():
+            _, ce, _ = self.model(x, y)
         (ce + self._anchor_penalty()).backward()
         grad_norm = float(torch.nn.utils.clip_grad_norm_(self.trainable, self.cfg.grad_clip))
         self.opt.step()
+        # Free the gradients now rather than at the next step: between
+        # updates they would sit in memory as one more copy of the network.
+        self.opt.zero_grad(set_to_none=True)
+        self.tokens_learned += int((y != IGNORE_INDEX).sum())
         return grad_norm, self._project_trust_region()
 
     def _after_update(self, report: UpdateReport) -> None:
@@ -959,7 +1020,9 @@ class OnlineLearner:
                 named = dict(self.model.named_parameters())
                 e = self.cfg.anchor_ema
                 for n in self.trainable_names:
-                    self.anchor[n].mul_(e).add_(named[n].detach(), alpha=1 - e)
+                    if n in self.anchor:
+                        a = self.anchor[n]
+                        a.copy_(a.float().mul_(e).add_(named[n].detach(), alpha=1 - e))
 
         if self.cfg.health_check:
             self.last_good = self._snapshot()
@@ -990,6 +1053,7 @@ class OnlineLearner:
         self.turns_seen = d.get("turns_seen", 0)
         self.since_health = d.get("since_health", 0)
         self.since_consolidation = d.get("since_consolidation", 0)
+        self.tokens_learned = d.get("tokens_learned", 0)
         if "canary_baseline" in d:
             # The stored baseline belongs to the stored weights. Keep whichever
             # is lower so a fresh, better model is not held to a stale bar.
@@ -1004,6 +1068,7 @@ class OnlineLearner:
             "turns_seen": self.turns_seen,
             "since_health": self.since_health,
             "since_consolidation": self.since_consolidation,
+            "tokens_learned": self.tokens_learned,
             "canary_baseline": self.canary_baseline,
             "plasticity": self.cfg.plasticity,
         }, indent=2))
@@ -1015,11 +1080,27 @@ class OnlineLearner:
             atomic_save(
                 {
                     "model": half_state_dict(merged_state_dict(self.model)),
+                    # Growth adds layers; the base checkpoint doesn't know.
+                    "n_layer": self.model.cfg.n_layer,
                     "updates_applied": self.updates_applied,
                     "canary_baseline": self.canary_baseline,
                 },
                 self.state_dir / "learned.pt",
             )
+
+    def capacity_tokens(self) -> float:
+        """Roughly how much text this model has room to learn from.
+
+        The rule of thumb from scaling-law studies is ~20 training tokens per
+        parameter: past that point a larger model gets more out of the same
+        text than more passes through a small one. It is a guide, not a wall
+        — the model keeps learning, just less per token."""
+        return self.cfg.tokens_per_param * self.model.num_params()
+
+    def room_left(self) -> float:
+        """Fraction of `capacity_tokens` not yet used (never below 0)."""
+        used = self.prior_tokens + self.tokens_learned
+        return max(0.0, 1.0 - used / self.capacity_tokens())
 
     def status(self) -> dict[str, Any]:
         return {
@@ -1035,6 +1116,10 @@ class OnlineLearner:
             "replay_size": len(self.replay),
             "replay_seen": self.replay.seen,
             "disk_mb": round(dir_size_mb(self.state_dir), 2),
+            "layers": self.model.cfg.n_layer,
+            "tokens_learned": self.tokens_learned,
+            "room_left": round(self.room_left(), 3),
+            "memory_saver": self.saving_memory,
         }
 
 
@@ -1047,7 +1132,14 @@ def resume_learned_weights(model: GPT, state_dir: str | Path,
     p = Path(state_dir) / "learned.pt"
     if not p.exists():
         return False
-    state = torch.load(p, map_location=device, weights_only=True)
+    # mmap: the file is paged in as needed, not copied whole into memory.
+    state = torch.load(p, map_location=device, weights_only=True, mmap=True)
+    grown_to = state.get("n_layer", model.cfg.n_layer)
+    if grown_to > model.cfg.n_layer:
+        # She grew in an earlier session: give the base model the same
+        # (still empty) layers so the learned weights have somewhere to go.
+        from .model import grow
+        grow(model, grown_to - model.cfg.n_layer)
     try:
         model.load_state_dict(state["model"])
     except RuntimeError as e:
@@ -1057,6 +1149,15 @@ def resume_learned_weights(model: GPT, state_dir: str | Path,
             f"to start over.\n{e}"
         ) from None
     return True
+
+
+def bf16_supported(device: str) -> bool:
+    try:
+        if str(device).startswith("cuda"):
+            return torch.cuda.is_bf16_supported()
+        return bool(torch.ops.mkldnn._is_mkldnn_bf16_supported())
+    except (AttributeError, RuntimeError):
+        return False
 
 
 def drive(gen: Generator[LearnProgress, None, UpdateReport],

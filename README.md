@@ -325,10 +325,11 @@ much faster.
 
 ## How big does Aria get?
 
-**The same size forever.** A neural network's size is fixed by its shape —
-how many layers, how wide — not by how much it has learned. Learning changes
-the values of the weights; it never adds any. An Aria that has read a hundred
-books is exactly as large as a fresh one.
+**The same size, until she grows.** A neural network's size is fixed by its
+shape — how many layers, how wide — not by how much it has learned. Learning
+changes the values of the weights; it never adds any. An Aria that has read a
+hundred books is exactly as large as a fresh one. The only thing that makes her
+bigger is [growing](#growing-more-room-to-learn), which you control.
 
 Measured:
 
@@ -359,14 +360,69 @@ What keeps it small (`aria/storage.py`):
 
 `aria status` and the page header show how much disk her memory uses. To carry
 everything she has learned as one file: `aria export --with-learning --out
-my-aria.pt` (13 MB for the small model).
+my-aria.pt` (13 MB for the small model). Add `--int8` for one byte per weight
+— the shipped model becomes 13.2 MB instead of 19.7, and its loss on held-out
+WikiText moves from 3.6896 to 3.6901 (+0.02%). That's for sharing and
+archiving; the weights she is learning in stay 16-bit, because rounding to 8
+bits on every save would erase small lessons.
 
-**The other side of a fixed size is a fixed capacity.** A 6.5M-parameter
-network can only hold so much; past some point, new learning overwrites old,
-which rehearsal slows but cannot stop. If you plan to feed her a library, start
-from a larger shape — `aria blank --size base` is ~100M parameters, about
-200 MB on disk and a few GB of RAM, and wants a GPU for learning at a
-reasonable speed.
+### Growing: more room to learn
+
+The other side of a fixed size is a fixed capacity. A 6.5M-parameter network
+can only hold so much; past some point new learning overwrites old, which
+rehearsal slows but cannot stop. So she can **grow**: `/grow` (in the page or
+the terminal) adds a layer on top, `/grow 3` adds three.
+
+A new layer starts out doing exactly nothing — its output projections are
+zero — so the grown model gives *bit-for-bit* the same answers and loses
+nothing she learned. Gradients still reach it, and it starts contributing as
+soon as she learns again. In the default mode, the original layers keep
+learning through their protected adapters; grown layers have no prior
+knowledge to protect and are trained directly. Growth is saved with her
+learned weights and restored in every later session.
+
+She also **grows by herself** when she has read more than her size has room
+for. The rule of thumb from scaling-law research is about 20 tokens of
+training text per parameter; past that, a bigger model learns more from the
+same text than more passes through a small one. The page header shows how
+much room is left (the shipped model's pretraining used a quarter of it).
+When it reaches zero, the next upload ends with one more layer, up to twice
+her original depth (`--learner-grow-max-factor`, 0 to turn automatic growth
+off). Each layer of the small model costs 1.5 MB on disk.
+
+### A larger, smarter model, kept manageable
+
+For a much larger model — `aria blank --size base` is 76M parameters as a
+blank model — memory saving switches on by itself (above 20M parameters,
+`--learner-memory-saver on|off|auto`):
+
+- a **low-memory optimiser** (`aria/optim.py`): 2 bytes of bookkeeping per
+  weight instead of AdamW's 8 — momentum in bfloat16, and the second moment of
+  each matrix kept as one value per row and per column (as in Adafactor);
+- **activation checkpointing**: during learning only each layer's input is
+  kept, and the rest is recomputed when needed;
+- **16-bit arithmetic** where the CPU (or GPU) has native bfloat16 — weights
+  stay 32-bit, only the matrix maths runs in 16 bits;
+- **half-precision safety snapshots**, and gradients freed straight after
+  each step;
+- weight files are **memory-mapped** on load instead of read into RAM first.
+
+Measured on the 76M-parameter blank model, learning from a document on four
+CPU cores:
+
+| | before | after |
+| --- | --- | --- |
+| peak RAM while learning | 3,385 MB | **1,926 MB** (−43%) |
+| RAM after loading | 1,161 MB | **866 MB** |
+| time per learning step | 1.96 s | **1.45 s** |
+| chatting only | — | 1,040 MB; 240-token replies in ~0.5 s |
+| learned weights on disk | 151 MB | 151 MB (76 MB as an `--int8` export) |
+
+The 16-bit arithmetic is what made it faster: 2.4× per step on this CPU,
+which has native bfloat16. On a CPU without it, Aria detects that and stays
+32-bit, and learning is about a third slower than before, because of the
+recomputation. Small models are unchanged: below 20M parameters none of this
+is needed.
 
 ---
 
@@ -481,9 +537,9 @@ exchanges:
 
 | check | what it asks | result |
 | --- | --- | --- |
-| **acquisition** | does teaching lower the loss on what was taught? | 6.68 → **2.53** (62% lower) |
-| **retention** | does the lesson survive 40 unrelated new ones? | **0.82–0.84** — far below the untaught 6.68 |
-| **stability** | is held-out English intact afterwards? | canary loss **+0.7% to +1.8%** across runs (tolerance 6%), 0 rollbacks |
+| **acquisition** | does teaching lower the loss on what was taught? | 6.68 → **2.5–2.6** (~62% lower) |
+| **retention** | does the lesson survive 40 unrelated new ones? | **0.82–0.91** — far below the untaught 6.68 |
+| **stability** | is held-out English intact afterwards? | canary loss **+0.7% to +2.7%** across runs (tolerance 6%), 0 rollbacks |
 | **persistence** | does it survive a restart? | a bare `GPT` loading the half-precision `learned.pt` gets **0.82**, the same as before saving, vs base **6.68** |
 
 The stability row is the one that matters. Fifty-two gradient updates went into
@@ -515,6 +571,7 @@ aria teach notes.txt more.docx         # learn from documents, any size
 aria teach chat.txt --speaker Jo       # learn to answer like Jo
 aria status [--blank]         # what the learner has been doing
 aria export --with-learning --out my-aria.pt   # everything she knows, one file
+aria export --with-learning --int8 --out my-aria.pt   # the same at one byte per weight
 ```
 
 Inside `chat`:
@@ -526,6 +583,7 @@ Inside `chat`:
 /upload <file> [as <name>]   read a document or transcript and learn from it
                              (or drag the file into the terminal)
 /correct <text>  replace Aria's last reply with yours and learn from it (weight 3x, bypasses the gate)
+/grow [n]      add n layers (default 1) without losing anything learned
 /consolidate   force a consolidation pass
 /learn on|off  toggle online learning
 /save          write weights and memory to disk
@@ -654,19 +712,20 @@ requests from other sites.
 aria/
   config.py      dataclass configs and size presets
   tokenizer.py   byte-level BPE, trained from scratch
-  model.py       the transformer, KV cache, LoRA attach/merge
+  model.py       the transformer, KV cache, LoRA attach/merge, growth
   data.py        corpus prep, chat formatting, batching
   pretrain.py    offline training loop + Fisher estimation
   learner.py     the online learning engine
   memory.py      replay buffer and decision journal (bounded)
   documents.py   streaming readers for uploads: txt/md/docx/srt/vtt/pdf, transcripts
-  storage.py     compact, atomic weight files
+  storage.py     compact, atomic weight files (float16, int8, log-encoded Fisher)
+  optim.py       a low-memory Adam for large models
   sample.py      generation
   chat.py        REPL
   serve.py       local browser UI and background learning (standard library only)
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
-tests/           179 tests
+tests/           190 tests
 notebooks/       Colab notebook for a free GPU
 scripts/demo_learning.py     measures whether the learning actually works
 scripts/recompute_fisher.py  re-estimates a checkpoint's Fisher information

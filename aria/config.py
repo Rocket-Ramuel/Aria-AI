@@ -149,6 +149,18 @@ class LearnerConfig:
     consolidate_interval: int = 32  # applied updates between consolidations
     anchor_ema: float = 0.9         # anchor <- ema*anchor + (1-ema)*current
 
+    # --- memory and growth -----------------------------------------------
+    # "auto" turns memory saving on above 20M parameters: a low-memory
+    # optimiser (~2 bytes of state per weight instead of 8), activation
+    # checkpointing, and half-precision safety snapshots.
+    memory_saver: str = "auto"
+    # Growth adds layers when the model has learned from more text than its
+    # size has room for (tokens_per_param tokens per parameter), up to
+    # grow_max_factor times its original depth. 0 turns automatic growth off;
+    # /grow always works.
+    tokens_per_param: float = 20.0
+    grow_max_factor: float = 2.0
+
     seed: int = 7
 
 

@@ -63,7 +63,7 @@ def generate(
     stop = set(stop_ids)
 
     for _ in range(max_new_tokens):
-        step_logits = logits[:, -1, :].clone()
+        step_logits = logits[:, -1, :].float()   # float32 even under bfloat16 autocast
 
         if repetition_penalty != 1.0:
             recent = (ids + generated)[-no_repeat_window:]

@@ -30,6 +30,9 @@ from typing import Any
 import torch
 
 FISHER_ENCODING = "log-uint8"
+INT8_ENCODING = "int8-rows"
+# Matrices smaller than this aren't worth quantising (norm gains, tiny models).
+_INT8_MIN_NUMEL = 4096
 _HALF_MAX = 65504.0
 
 
@@ -120,3 +123,45 @@ def process_ram_mb() -> float | None:
         return peak / (1e6 if sys.platform == "darwin" else 1e3)
     except (ImportError, OSError):
         return None
+
+
+def int8_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, Any]:
+    """Weights at one byte each: an archive or shareable copy at a quarter of
+    float32 (half of float16).
+
+    Each matrix row gets its own float16 scale and its values are rounded to
+    the nearest of 255 levels between -max and +max of that row. Vectors and
+    small matrices stay float16. Loading turns everything back into float32,
+    so a model learns on top of int8 weights exactly as it would on any other;
+    the cost is a small, measured loss of quality (see README), which is why
+    this is for exports, never for the weights Aria is learning in.
+    """
+    out: dict[str, Any] = {}
+    seen: dict[tuple, Any] = {}
+    for k, v in sd.items():
+        key = (v.untyped_storage().data_ptr(), v.storage_offset(), tuple(v.shape))
+        if key in seen:
+            out[k] = seen[key]
+            continue
+        if v.is_floating_point() and v.dim() >= 2 and v.numel() >= _INT8_MIN_NUMEL:
+            w = v.detach().float()
+            scale = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 127
+            q = (w / scale).round().clamp(-127, 127).to(torch.int8)
+            enc = {"encoding": INT8_ENCODING, "q": q, "scale": scale.half()}
+        else:
+            enc = v.detach().half() if v.is_floating_point() else v
+        seen[key] = out[k] = enc
+    return out
+
+
+def dequantize_state_dict(sd: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Plain tensors from any stored form (int8 rows, float16, float32)."""
+    out, seen = {}, {}
+    for k, v in sd.items():
+        if isinstance(v, dict) and v.get("encoding") == INT8_ENCODING:
+            if id(v) not in seen:
+                seen[id(v)] = v["q"].float() * v["scale"].float()
+            out[k] = seen[id(v)]
+        else:
+            out[k] = v
+    return out

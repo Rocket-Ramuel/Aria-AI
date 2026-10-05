@@ -20,6 +20,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _recompute
 
 from .config import ModelConfig
 
@@ -166,6 +167,12 @@ class GPT(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
+        # Activation checkpointing: during training, keep only each block's
+        # input and recompute its insides on the backward pass. ~30% more
+        # compute for a fraction of the activation memory, which is what
+        # lets a large model learn on an ordinary machine.
+        self.checkpointing = False
+
         self.apply(self._init_weights)
         # Scale down the projections that write into the residual stream, so
         # residual variance does not grow with depth.
@@ -212,9 +219,13 @@ class GPT(nn.Module):
 
         x = self.drop(self.tok_emb(idx))
         new_caches = []
+        recompute = self.checkpointing and self.training and torch.is_grad_enabled()
         for i, block in enumerate(self.blocks):
             cache = kv_caches[i] if kv_caches is not None else None
-            x, c = block(x, cos, sin, cache)
+            if recompute and cache is None:
+                x, c = _recompute(block, x, cos, sin, use_reentrant=False)
+            else:
+                x, c = block(x, cos, sin, cache)
             new_caches.append(c)
         x = self.norm_f(x)
 
@@ -234,6 +245,42 @@ class GPT(nn.Module):
 
     def empty_cache(self) -> list[None]:
         return [None] * self.cfg.n_layer
+
+
+@torch.no_grad()
+def grow(model: GPT, n_new: int) -> int:
+    """Add `n_new` transformer blocks on top, without changing what the model
+    does.
+
+    Each new block's output projections (attention `o_proj`, feed-forward
+    `down_proj`) start at exactly zero, so the block adds nothing to the
+    residual stream: the grown model computes the same function, to the bit,
+    and loses nothing it learned. Gradients still reach those projections, so
+    the new layers start contributing as soon as learning resumes. Appending
+    at the top keeps every existing parameter's name, so Fisher information,
+    snapshots and saved weights still line up.
+
+    Returns the new number of layers. Call on a model without LoRA attached.
+    """
+    if n_new <= 0:
+        return model.cfg.n_layer
+    device = next(model.parameters()).device
+    for _ in range(n_new):
+        block = Block(model.cfg)
+        block.apply(GPT._init_weights)
+        nn.init.zeros_(block.attn.o_proj.weight)
+        nn.init.zeros_(block.ffn.down_proj.weight)
+        model.blocks.append(block.to(device))
+    model.cfg.n_layer = len(model.blocks)
+    return model.cfg.n_layer
+
+
+def block_index(param_name: str) -> int | None:
+    """`blocks.7.attn.q_proj.weight` -> 7; None for non-block parameters."""
+    parts = param_name.split(".")
+    if len(parts) < 2 or parts[0] != "blocks" or not parts[1].isdigit():
+        return None
+    return int(parts[1])
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +319,20 @@ def attach_lora(
     rank: int = 8,
     alpha: float = 16.0,
     targets: tuple[str, ...] = DEFAULT_LORA_TARGETS,
+    below_layer: int | None = None,
 ) -> int:
     """Wrap the targeted `nn.Linear` layers in LoRA adapters, in place.
+
+    `below_layer` limits adapters to the original blocks; grown blocks are
+    trained directly instead (an adapter over a zero matrix has nothing to
+    measure its trust region against).
 
     Returns the number of layers adapted."""
     n = 0
     for parent_name, parent in list(model.named_modules()):
+        idx = block_index(parent_name + ".") if parent_name else None
+        if below_layer is not None and idx is not None and idx >= below_layer:
+            continue
         for child_name, child in list(parent.named_children()):
             if child_name in targets and isinstance(child, nn.Linear):
                 setattr(parent, child_name, LoRALinear(child, rank, alpha))

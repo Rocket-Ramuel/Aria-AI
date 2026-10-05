@@ -19,7 +19,8 @@ import torch
 from .config import AriaConfig, ModelConfig, TrainConfig, blank_learner_config, preset
 from .data import ChatSet, TokenStream, mixed_batch
 from .model import GPT
-from .storage import atomic_save, decode_fisher, encode_fisher, half_state_dict
+from .storage import (atomic_save, decode_fisher, dequantize_state_dict, encode_fisher,
+                      half_state_dict, int8_state_dict)
 from .tokenizer import BPETokenizer
 
 
@@ -131,13 +132,16 @@ def load_checkpoint(path: str | Path, device: str = "cpu"):
     # weights_only: checkpoints get shared, and a full unpickle of a file
     # someone sent you can run arbitrary code. Everything Aria stores is
     # tensors and plain containers, which the restricted loader handles.
-    ckpt = torch.load(path, map_location=device, weights_only=True)
+    # mmap: weights are paged in from the file as they are copied into the
+    # model, instead of being read into memory first — one copy, not two.
+    ckpt = torch.load(path, map_location=device, weights_only=True, mmap=True)
     cfg = AriaConfig.from_dict(ckpt["config"])
     tok = BPETokenizer(merges=[tuple(m) for m in ckpt["tokenizer"]["merges"]],
                        specials=ckpt["tokenizer"]["specials"])
     # However the Fisher was stored (float32, float16, 8-bit log codes),
     # callers get float32.
     ckpt["fisher"] = decode_fisher(ckpt.get("fisher"))
+    ckpt["model"] = dequantize_state_dict(ckpt["model"])
     model = GPT(cfg.model).to(device)
     # load_state_dict casts on copy, so a half-precision export loads straight
     # into the float32 model without any special handling here.
@@ -167,7 +171,8 @@ def resolve_checkpoint(path: str | Path | None) -> Path:
 
 def export_checkpoint(src: str | Path, dst: str | Path, half: bool = True,
                       keep_fisher: bool = True,
-                      learned: str | Path | None = None) -> dict:
+                      learned: str | Path | None = None,
+                      int8: bool = False) -> dict:
     """Write a compact, shareable copy of a checkpoint.
 
     Half precision halves the file for no measurable quality cost at this size
@@ -180,15 +185,19 @@ def export_checkpoint(src: str | Path, dst: str | Path, half: bool = True,
     since, so everything she knows travels as one self-contained file.
     """
     ckpt = torch.load(src, map_location="cpu", weights_only=True)
-    weights = ckpt["model"]
+    weights = dequantize_state_dict(ckpt["model"])
+    config = ckpt["config"]
     if learned is not None:
-        weights = torch.load(learned, map_location="cpu", weights_only=True)["model"]
+        state = torch.load(learned, map_location="cpu", weights_only=True)
+        weights = state["model"]
+        if "n_layer" in state:            # she may have grown since
+            config = {**config, "model": {**config["model"], "n_layer": state["n_layer"]}}
     fisher = decode_fisher(ckpt.get("fisher")) if keep_fisher else None
 
     out = {
-        "model": half_state_dict(weights) if half else
+        "model": int8_state_dict(weights) if int8 else half_state_dict(weights) if half else
                  {k: v.float() if v.is_floating_point() else v for k, v in weights.items()},
-        "config": ckpt["config"],
+        "config": config,
         "tokenizer": ckpt["tokenizer"],
         "step": ckpt.get("step"),
         "val_loss": ckpt.get("val_loss"),
@@ -197,6 +206,7 @@ def export_checkpoint(src: str | Path, dst: str | Path, half: bool = True,
     dst = Path(dst)
     atomic_save(out, dst)
     return {
+        "int8": int8,
         "source_mb": Path(src).stat().st_size / 1e6,
         "export_mb": dst.stat().st_size / 1e6,
         "half": half,

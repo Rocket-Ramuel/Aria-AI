@@ -171,7 +171,7 @@ PAGE_TEMPLATE = """<!doctype html>
     and words in the background while you keep talking.
     Commands: <code>/status</code>, <code>/memory</code>,
     <code>/correct &lt;what Aria should have said&gt;</code>, <code>/teach &lt;text&gt;</code>,
-    <code>/consolidate</code>, <code>/save</code>.
+    <code>/grow</code> (add a layer), <code>/consolidate</code>, <code>/save</code>.
   </div>
 </footer>
 
@@ -253,8 +253,9 @@ async function refreshMeta() {
   const mine = ++metaSeq;
   const s = await (await fetch('./api/status')).json();
   if (mine !== metaSeq) return;
-  let meta = `${s.params_m.toFixed(2)}M params · ${s.updates_applied.toLocaleString()} updates`
-    + ` · ${s.replay_size.toLocaleString()} memories · ${s.disk_mb.toFixed(1)} MB on disk`;
+  let meta = `${s.params_m.toFixed(2)}M params · ${s.layers} layers`
+    + ` · ${Math.round(100 * s.room_left)}% room left`
+    + ` · ${s.updates_applied.toLocaleString()} updates · ${s.disk_mb.toFixed(1)} MB on disk`;
   document.getElementById('meta').textContent = meta;
   if (modelSel.options.length !== s.models.length) {
     modelSel.innerHTML = '';
@@ -816,16 +817,17 @@ class _Handler(BaseHTTPRequestHandler):
                                            s.model.cfg.block_size)
                 pieces: list[int] = []
                 decoder = s.tok.stream_decoder()
-                for tid in generate(
-                    s.model, prompt, max_new_tokens=s.max_new_tokens,
-                    temperature=s.temperature, top_k=s.top_k, top_p=s.top_p,
-                    stop_ids=(s.tok.eot_id, s.tok.user_id, s.tok.bos_id),
-                    device=s.device,
-                ):
-                    pieces.append(tid)
-                    piece = decoder.feed(tid)
-                    if piece:
-                        self._event({"token": piece})
+                with s.learner.fast():
+                    for tid in generate(
+                        s.model, prompt, max_new_tokens=s.max_new_tokens,
+                        temperature=s.temperature, top_k=s.top_k, top_p=s.top_p,
+                        stop_ids=(s.tok.eot_id, s.tok.user_id, s.tok.bos_id),
+                        device=s.device,
+                    ):
+                        pieces.append(tid)
+                        piece = decoder.feed(tid)
+                        if piece:
+                            self._event({"token": piece})
                 tail = decoder.flush()
                 if tail:
                     self._event({"token": tail})

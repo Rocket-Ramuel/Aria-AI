@@ -164,7 +164,8 @@ def _cmd_export(args) -> int:
             return 1
     info = export_checkpoint(checkpoint, args.out,
                              half=not args.full_precision,
-                             keep_fisher=not args.no_fisher, learned=learned)
+                             keep_fisher=not args.no_fisher, learned=learned,
+                             int8=args.int8)
     print(f"wrote {args.out}")
     print(f"  {info['source_mb']:.1f} MB -> {info['export_mb']:.1f} MB"
           f"  (half={info['half']}, fisher={info['fisher']})")
@@ -393,6 +394,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="bake in what was learned (from the checkpoint's own "
                          "state directory)")
     ex.add_argument("--out", default="checkpoints/aria-small.pt")
+    ex.add_argument("--int8", action="store_true",
+                    help="one byte per weight: smallest file, slight quality cost "
+                         "(for sharing and archives)")
     ex.add_argument("--full-precision", action="store_true",
                     help="keep float32 instead of halving the file size")
     ex.add_argument("--no-fisher", action="store_true",
