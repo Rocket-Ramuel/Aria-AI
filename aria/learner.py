@@ -1076,7 +1076,7 @@ class OnlineLearner:
         p = self._runtime_path()
         if not p.exists():
             return
-        d = json.loads(p.read_text())
+        d = json.loads(p.read_text(encoding="utf-8"))
         self.lr = d.get("lr", self.lr)
         self.ema_loss = d.get("ema_loss", self.ema_loss)
         self.updates_applied = d.get("updates_applied", 0)
@@ -1101,7 +1101,7 @@ class OnlineLearner:
             "tokens_learned": self.tokens_learned,
             "canary_baseline": self.canary_baseline,
             "plasticity": self.cfg.plasticity,
-        }, indent=2))
+        }, indent=2), encoding="utf-8")
         if weights:
             # The *merged* weights, so the file is a plain model checkpoint
             # that loads without knowing anything about LoRA; in float16 with

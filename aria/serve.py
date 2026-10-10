@@ -28,6 +28,7 @@ from __future__ import annotations
 import io
 import itertools
 import json
+import os
 import queue
 import re
 import shutil
@@ -40,9 +41,10 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
+from . import __version__
 from .chat import SNIFF_LINES, ChatSession, _command as run_command
 from .documents import (SUBTITLE_SUFFIXES, SUPPORTED_SUFFIXES, TEXT_SUFFIXES,
                         iter_lines, parse_transcript, speakers, suffix_of)
@@ -139,6 +141,11 @@ PAGE_TEMPLATE = """<!doctype html>
     font-size: 12.5px; text-decoration: underline;
   }
   button:disabled { opacity: .5; cursor: default; }
+  #banner {
+    display: none; padding: 10px 16px; text-align: center; font-size: 13.5px;
+    background: var(--card); border-bottom: 1px solid var(--line);
+  }
+  body.offline #banner { display: block; }
   .hint { max-width: 720px; margin: 7px auto 0; color: var(--muted); font-size: 12px; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   body.dragging #log { outline: 2px dashed var(--accent); outline-offset: -8px; }
@@ -152,7 +159,9 @@ PAGE_TEMPLATE = """<!doctype html>
   <span class="spacer"></span>
   <label class="toggle"><input type="checkbox" id="showlearn" checked> show learning</label>
   <label class="toggle"><input type="checkbox" id="dolearn" checked> learn from this chat</label>
+  <button type="button" id="quit" class="small quiet" title="Save what she has learned and stop Aria" hidden>Quit Aria</button>
 </header>
+<div id="banner" role="status"></div>
 
 <div id="log"><div class="wrap" id="wrap"></div></div>
 
@@ -178,6 +187,7 @@ PAGE_TEMPLATE = """<!doctype html>
 
 <script>
 const TEXTY = TEXTY_JSON;
+const APP_MODE = APP_MODE_JSON;
 const wrap = document.getElementById('wrap');
 const log = document.getElementById('log');
 const form = document.getElementById('form');
@@ -187,8 +197,42 @@ const showlearn = document.getElementById('showlearn');
 const dolearn = document.getElementById('dolearn');
 const modelSel = document.getElementById('model');
 const fileInput = document.getElementById('file');
+const banner = document.getElementById('banner');
+const quitBtn = document.getElementById('quit');
 const cards = new Map();
 let polling = false;
+
+// When Aria isn't running any more (she was quit, here or from her window),
+// say so instead of failing silently.
+let quitted = false;
+function stopped(text) {
+  banner.textContent = text;
+  document.body.classList.add('offline');
+  send.disabled = true;
+  input.disabled = true;
+}
+function lost() {
+  stopped(APP_MODE
+    ? "Aria isn't running. Open the Aria app to talk to her again \\u2014 she remembers what she learned."
+    : "Can't reach Aria. Is the server (python -m aria serve) still running?");
+}
+function back() {
+  if (quitted || !document.body.classList.contains('offline')) return;
+  document.body.classList.remove('offline');
+  send.disabled = false;
+  input.disabled = false;
+}
+if (APP_MODE) {
+  quitBtn.hidden = false;
+  quitBtn.addEventListener('click', async () => {
+    quitBtn.disabled = true;
+    quitted = true;
+    try { await postJSON('./api/quit', {}); } catch (e) {}
+    stopped('Aria has stopped and saved everything she learned. You can close this tab; '
+            + 'open the Aria app to talk to her again.');
+  });
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshMeta(); });
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -252,8 +296,15 @@ async function refreshMeta() {
   // Several refreshes can be in flight (a finished upload, a reply, a model
   // switch); only the newest answer may update the page.
   const mine = ++metaSeq;
-  const s = await (await fetch('./api/status')).json();
+  let s;
+  try {
+    s = await (await fetch('./api/status')).json();
+  } catch (e) {
+    if (mine === metaSeq) lost();
+    return;
+  }
   if (mine !== metaSeq) return;
+  back();
   let meta = `${s.params_m.toFixed(2)}M params · ${s.layers} layers`
     + ` · ${Math.round(100 * s.room_left)}% room left`
     + ` · ${s.updates_applied.toLocaleString()} updates · ${s.disk_mb.toFixed(1)} MB on disk`;
@@ -292,7 +343,13 @@ form.addEventListener('submit', async (e) => {
 
   if (text.startsWith('/')) {
     bubble('user', text);
-    const [, d] = await postJSON('./api/command', {command: text});
+    let d;
+    try {
+      [, d] = await postJSON('./api/command', {command: text});
+    } catch (e) {
+      lost();
+      return;
+    }
     note(d.output || d.error || '(no output)');
     await refreshMeta();
     send.disabled = false; input.focus();
@@ -302,27 +359,33 @@ form.addEventListener('submit', async (e) => {
   bubble('user', text);
   const target = bubble('aria', '');
   let started = false;
-  const res = await fetch('./api/chat', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({message: text, learn: dolearn.checked}),
-  });
-  await readEvents(res, ev => {
-    if (ev.token !== undefined) {
-      // Replies begin with the chat format's leading space; don't show it.
-      const tok = started ? ev.token : ev.token.trimStart();
-      if (tok) {
-        started = true;
-        target.appendChild(document.createTextNode(tok));
+  try {
+    const res = await fetch('./api/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text, learn: dolearn.checked}),
+    });
+    await readEvents(res, ev => {
+      if (ev.token !== undefined) {
+        // Replies begin with the chat format's leading space; don't show it.
+        const tok = started ? ev.token : ev.token.trimStart();
+        if (tok) {
+          started = true;
+          target.appendChild(document.createTextNode(tok));
+        }
+        scroll();
+      } else if (ev.recall !== undefined) {
+        note(ev.recall);
+      } else if (ev.learn !== undefined) {
+        note(ev.learn);
+      } else if (ev.error !== undefined) {
+        note('error: ' + ev.error);
       }
-      scroll();
-    } else if (ev.recall !== undefined) {
-      note(ev.recall);
-    } else if (ev.learn !== undefined) {
-      note(ev.learn);
-    } else if (ev.error !== undefined) {
-      note('error: ' + ev.error);
-    }
-  });
+    });
+  } catch (e) {
+    if (!started) target.remove();
+    lost();
+    return;
+  }
   await refreshMeta();
   send.disabled = false; input.focus();
 });
@@ -383,6 +446,8 @@ async function poll() {
       if (!active) break;
       await new Promise(r => setTimeout(r, 1000));
     }
+  } catch (e) {
+    // Aria stopped; refreshMeta below says so.
   } finally {
     polling = false;
     refreshMeta();
@@ -466,9 +531,15 @@ poll();
 </body>
 </html>
 """
-PAGE = (PAGE_TEMPLATE
-        .replace("ACCEPT", ",".join(SUPPORTED_SUFFIXES))
-        .replace("TEXTY_JSON", json.dumps(list(TEXT_SUFFIXES + SUBTITLE_SUFFIXES))))
+def render_page(app_mode: bool = False) -> str:
+    """The chat page. In the app it also has a Quit button."""
+    return (PAGE_TEMPLATE
+            .replace("ACCEPT", ",".join(SUPPORTED_SUFFIXES))
+            .replace("TEXTY_JSON", json.dumps(list(TEXT_SUFFIXES + SUBTITLE_SUFFIXES)))
+            .replace("APP_MODE_JSON", json.dumps(app_mode)))
+
+
+PAGE = render_page()
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +699,9 @@ class App:
         self.sessions: dict[str, ChatSession] = dict(sessions or {})
         self.lock = FairLock()
         self.jobs = JobRunner(self)
+        # Set by the desktop app: what the page's Quit button does.
+        self.on_quit: Callable[[], None] | None = None
+        self._saved = {k: self._mark(s) for k, s in self.sessions.items()}
 
     @classmethod
     def for_session(cls, session: ChatSession, label: str = "Aria") -> "App":
@@ -643,7 +717,28 @@ class App:
             # Leftovers from a server that was killed mid-upload.
             shutil.rmtree(s.state_dir / "uploads", ignore_errors=True)
             self.sessions[key] = s
+            self._saved[key] = self._mark(s)
         return self.sessions[key]
+
+    @staticmethod
+    def _mark(s: ChatSession) -> tuple[int, int]:
+        return (s.learner.updates_applied, s.learner.turns_seen)
+
+    def save_if_changed(self) -> list[str]:
+        """Save each model that has learned something since it was last saved,
+        so a crash or a dead battery loses minutes, not a whole session. One
+        reading a document is skipped: that saves itself as it goes."""
+        saved = []
+        with self.lock:
+            for key, s in self.sessions.items():
+                if not s.busy and self._saved.get(key) != self._mark(s):
+                    s.save()
+                    self._saved[key] = self._mark(s)
+                    saved.append(key)
+        return saved
+
+    def active_jobs(self) -> list[dict[str, Any]]:
+        return [j for j in self.jobs.views() if j["state"] in ("queued", "running")]
 
     def switch(self, key: str) -> None:
         if key not in self.slots:
@@ -675,13 +770,22 @@ def _hostname(host_header: str) -> str:
     return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
 
 
-def make_handler(app: App, allowed_hosts: frozenset = LOCAL_HOSTS) -> type:
-    return type("Handler", (_Handler,), {"app": app, "allowed_hosts": allowed_hosts})
+def make_handler(app: App, allowed_hosts: frozenset = LOCAL_HOSTS,
+                 page: str = PAGE) -> type:
+    return type("Handler", (_Handler,), {"app": app, "allowed_hosts": allowed_hosts,
+                                         "page": page.encode()})
+
+
+class _HTTPServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second server bind a port that is
+    # already in use, and the two then split the requests between them.
+    allow_reuse_address = os.name != "nt"
 
 
 class _Handler(BaseHTTPRequestHandler):
     app: App
     allowed_hosts: frozenset = LOCAL_HOSTS
+    page: bytes = PAGE.encode()
     server_version = "aria"
 
     def log_message(self, fmt, *args):  # quieter console
@@ -752,7 +856,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._refuse()
             return
         if self.route in ("/", "/index.html"):
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            self._send(200, self.page, "text/html; charset=utf-8")
+        elif self.route == "/api/hello":
+            # How the app recognises an Aria that is already running.
+            self._json({"app": "aria", "version": __version__, "pid": os.getpid()})
         elif self.route == "/api/status":
             self._json(self._status())
         elif self.route == "/api/jobs":
@@ -760,7 +867,7 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
-    JSON_ROUTES = ("/api/chat", "/api/command", "/api/model")
+    JSON_ROUTES = ("/api/chat", "/api/command", "/api/model", "/api/quit")
     RAW_ROUTES = ("/api/upload", "/api/inspect")
 
     def do_POST(self) -> None:
@@ -787,6 +894,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif cancel:
             ok = self.app.jobs.cancel(cancel.group(1))
             self._json({"ok": ok}, 200 if ok else 404)
+        elif route == "/api/quit" and self.app.on_quit is not None:
+            self._json({"ok": True})
+            self.app.on_quit()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -968,17 +1078,43 @@ class _Handler(BaseHTTPRequestHandler):
         self._json({"speakers": result})
 
 
-def serve(
+@dataclass
+class Server:
+    """A chat server, bound and with its model loaded, not yet serving."""
+
+    httpd: ThreadingHTTPServer
+    app: App
+    label: str
+
+    @property
+    def port(self) -> int:
+        return self.httpd.server_address[1]
+
+    @property
+    def session(self) -> ChatSession:
+        with self.app.lock:
+            return self.app.session()
+
+    def close(self) -> None:
+        """Stop accepting requests, finish learning steps, save everything.
+        (Call `httpd.shutdown()` first if `serve_forever` is running.)"""
+        self.httpd.server_close()
+        self.app.close()
+
+
+def build_server(
     checkpoint: str | Path | None = None,
     state_dir: str | Path | None = None,
     data_dir: str | Path = "data",
     host: str = "127.0.0.1",
-    port: int = 8000,
-    open_browser: bool = True,
+    port: int | tuple[int, ...] = 8000,
     allow_hosts: tuple[str, ...] = (),
     blank: bool = False,
+    app_mode: bool = False,
     **session_kwargs,
-) -> None:
+) -> Server:
+    """Bind the port and load the model. `port` may list several to try in
+    turn (0 lets the system pick a free one)."""
     slots: dict[str, dict[str, Any]] = {}
     try:
         pretrained = resolve_checkpoint(checkpoint)
@@ -992,19 +1128,50 @@ def serve(
     slots[active]["state_dir"] = state_dir
 
     app = App(slots, active, dict(session_kwargs, data_dir=data_dir))
-    with app.lock:
-        session = app.session()
-
     allowed = set(LOCAL_HOSTS) | {h.lower() for h in allow_hosts}
     if host not in ("0.0.0.0", "::", ""):
         allowed.add(host.lower())
-    httpd = ThreadingHTTPServer((host, port), make_handler(app, frozenset(allowed)))
+    handler = make_handler(app, frozenset(allowed), render_page(app_mode))
 
-    url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
+    # The port first: if it is taken, say so before spending time on the model.
+    ports = (port,) if isinstance(port, int) else tuple(port)
+    for i, p in enumerate(ports):
+        try:
+            httpd = _HTTPServer((host, p), handler)
+            break
+        except OSError:
+            if i == len(ports) - 1:
+                app.jobs.stop()
+                raise
+    try:
+        with app.lock:
+            app.session()
+    except BaseException:
+        httpd.server_close()
+        app.jobs.stop()
+        raise
+    return Server(httpd, app, slots[active]["label"])
+
+
+def serve(
+    checkpoint: str | Path | None = None,
+    state_dir: str | Path | None = None,
+    data_dir: str | Path = "data",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    open_browser: bool = True,
+    allow_hosts: tuple[str, ...] = (),
+    blank: bool = False,
+    **session_kwargs,
+) -> None:
+    server = build_server(checkpoint, state_dir, data_dir, host, port, allow_hosts,
+                          blank, **session_kwargs)
+    session = server.session
+    url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{server.port}"
     print(f"Aria is running at {url}")
     from .device import describe
     print(f"  running on the {describe(session.device)}")
-    print(f"  model      {slots[active]['label']}, "
+    print(f"  model      {server.label}, "
           f"{session.model.num_params()/1e6:.2f}M parameters")
     print(f"  memory     {session.state_dir}")
     if host not in LOCAL_HOSTS:
@@ -1019,10 +1186,9 @@ def serve(
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
     try:
-        httpd.serve_forever()
+        server.httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopping (finishing the current learning step) ...")
     finally:
-        httpd.server_close()
-        app.close()
-        print(f"saved to {', '.join(str(s.state_dir) for s in app.sessions.values())}")
+        server.close()
+        print(f"saved to {', '.join(str(s.state_dir) for s in server.app.sessions.values())}")

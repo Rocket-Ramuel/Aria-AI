@@ -25,6 +25,9 @@ However much she learns, she doesn't get bigger: learning changes the values of
 her weights, never their number. The shipped model is a 20 MB file and stays
 that size. [Details below](#how-big-does-aria-get).
 
+She runs as **an app on Mac, Windows and Linux** — double-click, and her chat
+opens in your browser; no terminal needed. [How to get it](#the-app).
+
 The online learning is the interesting part. Doing continual learning *naively* —
 one SGD step per turn on whatever the user just typed — reliably destroys a
 language model within a few hundred turns. Most of this repo is about not doing
@@ -92,6 +95,82 @@ in the whole project is `prepare` downloading the public-domain corpus once.
 itself). Any laptop from the last
 decade will do. macOS, Linux and Windows all work; a GPU is optional and
 [used automatically](#gpus-nvidia-and-apple-silicon) if you have one.
+
+### The app
+
+Opening Aria shows a small window, and a moment later her chat opens in your
+web browser — the same page as [`aria serve`](#the-browser-ui). The window is
+how you can tell she's running: close it (or press Quit, or **Quit Aria** on
+the page) and she saves everything she has learned and stops. Opening her again
+while she's running just opens the chat again. While she runs she also saves
+every five minutes, so a crash or a flat battery costs minutes, not a session.
+
+**Download it.** Each version is built and tested on a real Mac, Windows PC
+and Linux machine by [GitHub Actions](.github/workflows/apps.yml), and
+published on the [Releases page](https://github.com/Rocket-Ramuel/Aria-AI/releases).
+(The newest build, before it becomes a release, is under
+[Actions → Apps](https://github.com/Rocket-Ramuel/Aria-AI/actions/workflows/apps.yml):
+open the latest run with a green tick and download it from *Artifacts* at the
+bottom — that needs a GitHub login.)
+
+| your computer | download | then |
+| --- | --- | --- |
+| Mac with Apple Silicon (M1 or later) | `Aria-Mac.dmg` | open it and drag Aria into Applications |
+| Windows 10 or 11 | `Aria-Windows-Setup.exe` | run it; Aria appears in the Start menu |
+| Linux (64-bit PC) | `Aria-Linux.tar.gz` | extract it and open `Aria/Aria` |
+
+To check which Mac you have: Apple menu → **About This Mac**. "Chip: Apple M…"
+means the download works. "Processor: Intel" means use the folder way below
+(the app's AI library no longer supports Intel Macs).
+
+The first time you open her, your computer will be wary, because she isn't
+signed with a paid Apple or Microsoft certificate:
+
+- **Mac:** a message says Apple could not check Aria for malicious software.
+  Click **Done**, open **System Settings → Privacy & Security**, scroll down to
+  the line about Aria and click **Open Anyway**, then confirm. Only the first
+  time. (If it ever says Aria "is damaged", open Terminal and run
+  `xattr -dr com.apple.quarantine /Applications/Aria.app`.)
+- **Windows:** "Windows protected your PC" — click **More info**, then
+  **Run anyway**. Only the first time.
+
+The download is a few hundred MB, because the app carries its own copy of
+Python and PyTorch, the AI library.
+
+**Or run her from the downloaded folder.** If you have the code (Code → Download
+ZIP on GitHub, or a clone), there are double-click starters in it. They need
+[Python](https://www.python.org/downloads/) 3.10 or newer; the first start sets
+things up, which needs the internet and takes a few minutes, and after that she
+starts in seconds.
+
+- **Mac:** double-click `Start Aria (Mac).command`. The first time, macOS may
+  refuse a downloaded file: right-click it, choose **Open**, then **Open**
+  (or use Open Anyway as above).
+- **Windows:** double-click `Start Aria (Windows).bat` (if Windows warns, More
+  info → Run anyway). When installing Python, tick *Add python.exe to PATH*.
+- **Linux:** `./start-aria-linux.sh` (needs `python3-venv` and `python3-tk` on
+  Debian and Ubuntu).
+- **Anywhere:** `aria app` (or `python -m aria app`) after `pip install -e .`
+
+**Where her memory is.** What she learns is kept in your user folder, not in
+the app, so updating, reinstalling or deleting the app never touches it:
+
+| system | folder |
+| --- | --- |
+| macOS | `~/Library/Application Support/Aria` |
+| Windows | `%APPDATA%\Aria` |
+| Linux | `~/.local/share/aria` |
+
+To move her to another computer, copy that folder across. To keep her
+somewhere else — a synced folder, say — set the `ARIA_HOME` environment
+variable to it. The app writes a log, `aria.log`, in the same folder; that's
+the place to look if she won't start.
+
+**Building the app yourself:** `pip install pyinstaller pillow`, then
+`pyinstaller packaging/aria.spec` on the system you're building for, and
+`dist/Aria.app` or `dist/Aria/` appears. `aria app --self-test` checks a build:
+it starts her in a temporary folder, chats, reads a document, saves, quits and
+reloads, and reports each step.
 
 ### Talk to her straight away
 
@@ -220,11 +299,14 @@ and a chat reply takes a second or two. Each turn's learning update costs about
 as much as one more reply. It is comfortably interactive. Reading documents
 is slower — see [how long](#how-long-it-takes).
 
-Everything the learner accumulates lives in an `online/` directory next to the
-checkpoint it is learning on top of — `checkpoints/online/` for the shipped
-model, `runs/aria/online/` for one you trained, `runs/blank/online/` for a
-blank one. (`.gitignore` excludes every `online/` directory: the replay buffer
-and journal contain your conversations in plain text.)
+Everything the learner accumulates lives in an `online/` directory. For the
+shipped model and the blank one that is in Aria's [per-user
+folder](#the-app) (`online/` and `blank/online/` there), so it survives
+updates; a model you trained yourself keeps its memory next to it, in
+`runs/aria/online/`. Memory that older versions kept in `checkpoints/online/`
+or `runs/blank/` is moved to the per-user folder the first time it's used.
+(`.gitignore` excludes every `online/` directory: the replay buffer and journal
+contain your conversations in plain text.)
 
 | file | contents |
 | --- | --- |
@@ -325,8 +407,8 @@ Pick **Blank** in the menu at the top of the page, or:
 aria serve --blank        # or: aria chat --blank, aria teach --blank sample.txt
 ```
 
-That uses `runs/blank/base.pt`, creating it if needed (`aria blank` makes one
-explicitly, `--size tiny|small|base`). It is a model with random weights and a
+That uses `blank/base.pt` in Aria's [per-user folder](#the-app), creating it if
+needed (`aria blank` makes one explicitly, `--size tiny|small|base`). It is a model with random weights and a
 byte-level tokenizer with no learned vocabulary: it assumes nothing about
 English, spelling or grammar. Everything it ever produces it learned from what
 you uploaded and said, so its grammar and its voice can only be those of its
@@ -792,7 +874,9 @@ really protects an old lesson from being erased by forty new ones, and that
 the canary is never trained on. Uploads have their own tests (every format,
 transcript parsing, that a transcript trains only the chosen voice, that a
 blank model learns from a sample), and so does the server's refusal of
-requests from other sites.
+requests from other sites. So does the app: only one Aria at a time, the page's
+Quit button, autosave, where her memory goes on each system, and a full
+`--self-test` run.
 
 ---
 
@@ -811,7 +895,7 @@ requests from other sites.
   the drift; they do not make it neutral. Over thousands of turns Aria will
   become specifically adapted to how *you* write.
 - **Anything you type or upload may end up in the weights and on disk** in the
-  checkpoint's `online/` directory. Use `--no-learn` for anything you would not
+  model's `online/` directory. Use `--no-learn` for anything you would not
   want stored. A model that has learned someone's voice can reproduce their
   writing, sometimes verbatim — treat `learned.pt` as you would the documents
   you taught it.
@@ -840,9 +924,16 @@ aria/
   sample.py      generation
   chat.py        REPL
   serve.py       local browser UI and background learning (standard library only)
+  app.py         the desktop app: its window, one-at-a-time, autosave, --self-test
+  paths.py       where her memory lives on each system
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
-tests/           213 tests
+  icon.png                  the app icon (drawn by packaging/make_icon.py)
+tests/           230 tests
+packaging/       how the app is built: PyInstaller recipe, Windows installer, icon
+.github/workflows/apps.yml  builds and tests the Mac, Windows and Linux apps
+Start Aria (Mac).command, Start Aria (Windows).bat, start-aria-linux.sh
+                 double-click starters for running from this folder
 notebooks/       Colab notebook for a free GPU
 scripts/demo_learning.py     measures whether the learning actually works
 scripts/recompute_fisher.py  re-estimates a checkpoint's Fisher information

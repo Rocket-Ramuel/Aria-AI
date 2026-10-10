@@ -84,7 +84,7 @@ class ReplayBuffer:
         tmp.write_text(json.dumps(
             {"capacity": self.capacity, "seen": self.seen, "items": self.items},
             ensure_ascii=False,
-        ))
+        ), encoding="utf-8")
         tmp.replace(p)   # atomic, so an interrupted save cannot corrupt memory
 
     @classmethod
@@ -94,7 +94,7 @@ class ReplayBuffer:
         buf = cls(capacity=capacity or 4096, seed=seed)
         if not p.exists():
             return buf
-        d = json.loads(p.read_text())
+        d = json.loads(p.read_text(encoding="utf-8"))
         buf.capacity = capacity or d.get("capacity", 4096)
         buf.seen = d.get("seen", 0)
         buf.items = d.get("items", [])[: buf.capacity]
@@ -122,7 +122,7 @@ class Journal:
 
     def write(self, **record: Any) -> None:
         record.setdefault("t", time.time())
-        with open(self.path, "a") as f:
+        with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         if self.path.stat().st_size > self.max_bytes:
             self._rotate()
@@ -134,20 +134,20 @@ class Journal:
             for k in self._COUNTS + ("loss_sum",):
                 totals[k] = totals.get(k, 0) + dropped[k]
             tmp = self.totals_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(totals))
+            tmp.write_text(json.dumps(totals), encoding="utf-8")
             tmp.replace(self.totals_path)
         self.path.replace(self.rotated)
 
     def _totals(self) -> dict[str, float]:
         if self.totals_path.exists():
-            return json.loads(self.totals_path.read_text())
+            return json.loads(self.totals_path.read_text(encoding="utf-8"))
         return {}
 
     @staticmethod
     def _rows(path: Path) -> list[dict[str, Any]]:
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines() if line]
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
     @staticmethod
     def _count(rows: list[dict[str, Any]]) -> dict[str, float]:

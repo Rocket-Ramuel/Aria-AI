@@ -1,0 +1,207 @@
+# Builds Aria as an app for Mac, Windows and Linux, each on its own system,
+# and checks every one by running it (`--self-test`: load the model, chat,
+# read a document, save, quit, reload) before packaging it:
+#
+#   Mac      Aria-Mac.dmg, Aria-Mac.zip        (Apple Silicon: M1 and later)
+#   Windows  Aria-Windows-Setup.exe, Aria-Windows.zip
+#   Linux    Aria-Linux.tar.gz
+#
+# The files are attached to each run (Actions tab -> the run -> Artifacts).
+# Pushing a tag like v0.1.0 also publishes them as a GitHub release.
+
+name: Apps
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths:
+      - "aria/**"
+      - "checkpoints/**"
+      - "packaging/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "requirements.txt"
+      - ".github/workflows/apps.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apps-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Mac
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+          - name: Linux
+            os: ubuntu-22.04
+            # Without this, pip fetches the NVIDIA build: gigabytes of GPU
+            # libraries the app would carry around for nothing.
+            torch_index: https://download.pytorch.org/whl/cpu
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Linux needs Tk, and a virtual screen for the window check
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb libtk8.6 tk8.6
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          if [ -n "${{ matrix.torch_index }}" ]; then
+            python -m pip install torch --index-url "${{ matrix.torch_index }}"
+          else
+            python -m pip install torch
+          fi
+          python -m pip install "numpy>=1.24" pypdf pyinstaller pillow pytest
+          python -c "import torch, tkinter, PyInstaller; print('torch', torch.__version__, '| Tk', tkinter.TkVersion, '| PyInstaller', PyInstaller.__version__)"
+
+      - name: Self-test from source
+        timeout-minutes: 20
+        env:
+          ARIA_HOME: ${{ runner.temp }}/self-test-source
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a python -m aria app --self-test --require-window
+          else
+            python -m aria app --self-test --require-window
+          fi
+
+      - name: Build the app
+        run: pyinstaller --noconfirm --clean packaging/aria.spec
+
+      # ---- Mac ---------------------------------------------------------------
+      - name: "Mac: check the signature"
+        if: runner.os == 'macOS'
+        run: |
+          # Apple Silicon only runs signed code; PyInstaller signs "ad hoc".
+          codesign --verify --deep --strict --verbose=2 dist/Aria.app || {
+            codesign --force --deep --sign - dist/Aria.app
+            codesign --verify --deep --strict --verbose=2 dist/Aria.app
+          }
+
+      - name: "Mac: self-test the app"
+        timeout-minutes: 20
+        if: runner.os == 'macOS'
+        env:
+          ARIA_HOME: ${{ runner.temp }}/self-test-app
+        run: dist/Aria.app/Contents/MacOS/Aria --self-test --require-window
+
+      - name: "Mac: package"
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p out dmg
+          ditto -c -k --sequesterRsrc --keepParent dist/Aria.app out/Aria-Mac.zip
+          ditto dist/Aria.app dmg/Aria.app
+          ln -s /Applications dmg/Applications
+          # hdiutil is sometimes "busy" on the build machines; try again.
+          for i in 1 2 3 4 5; do
+            hdiutil create -volname Aria -srcfolder dmg -ov -format UDZO out/Aria-Mac.dmg && break
+            sleep 15
+          done
+          test -f out/Aria-Mac.dmg
+
+      # ---- Windows -----------------------------------------------------------
+      - name: "Windows: self-test the app"
+        timeout-minutes: 20
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARIA_HOME: ${{ runner.temp }}\self-test-app
+        run: |
+          $p = Start-Process -FilePath dist\Aria\Aria.exe -ArgumentList "--self-test","--require-window" -Wait -PassThru
+          Get-Content "$env:ARIA_HOME\aria.log"
+          if ($p.ExitCode -ne 0) { throw "self-test failed ($($p.ExitCode))" }
+
+      - name: "Windows: package"
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          7z a -tzip -mx=5 out\Aria-Windows.zip .\dist\Aria | Out-Null
+          python -c "from PIL import Image; Image.open('aria/icon.png').save('dist/aria.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $version = python -c "import aria; print(aria.__version__)"
+          & $iscc "/DAppVersion=$version" packaging\windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "the installer didn't build" }
+          Move-Item dist\Aria-Windows-Setup.exe out\
+
+      - name: "Windows: install it and self-test the installed app"
+        timeout-minutes: 20
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARIA_HOME: ${{ runner.temp }}\self-test-installed
+        run: |
+          $p = Start-Process -FilePath out\Aria-Windows-Setup.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "install failed ($($p.ExitCode))" }
+          $exe = "$env:LOCALAPPDATA\Programs\Aria\Aria.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "--self-test","--require-window" -Wait -PassThru
+          Get-Content "$env:ARIA_HOME\aria.log"
+          if ($p.ExitCode -ne 0) { throw "self-test of the installed app failed ($($p.ExitCode))" }
+
+      # ---- Linux -------------------------------------------------------------
+      - name: "Linux: self-test the app"
+        timeout-minutes: 20
+        if: runner.os == 'Linux'
+        env:
+          ARIA_HOME: ${{ runner.temp }}/self-test-app
+        run: xvfb-run -a dist/Aria/Aria --self-test --require-window
+
+      - name: "Linux: package"
+        if: runner.os == 'Linux'
+        run: mkdir -p out && tar -czf out/Aria-Linux.tar.gz -C dist Aria
+
+      # ------------------------------------------------------------------------
+      - name: Sizes
+        run: ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Aria-${{ matrix.name }}
+          path: out/*
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: The full test suite
+        run: python -m pytest -q
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

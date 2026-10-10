@@ -151,19 +151,24 @@ def load_checkpoint(path: str | Path, device: str = "cpu"):
 
 
 # Where `--checkpoint` looks when it is not given explicitly: a model you
-# trained yourself wins, then whatever ships with the repo.
+# trained yourself wins, then whatever ships with Aria — found in the current
+# directory, or wherever Aria is installed (see aria.paths).
 DEFAULT_CHECKPOINTS = ("runs/aria/base.pt", "checkpoints/aria-small.pt")
 
 
 def resolve_checkpoint(path: str | Path | None) -> Path:
+    from .paths import shipped_checkpoint
     if path:
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"no checkpoint at {p}")
         return p
-    for candidate in DEFAULT_CHECKPOINTS:
-        if Path(candidate).exists():
-            return Path(candidate)
+    trained = Path(DEFAULT_CHECKPOINTS[0])
+    if trained.exists():
+        return trained
+    shipped = shipped_checkpoint()
+    if shipped is not None:
+        return shipped
     raise FileNotFoundError(
         "no checkpoint found. Train one with `aria quickstart`, or pass "
         "--checkpoint explicitly. Looked in: " + ", ".join(DEFAULT_CHECKPOINTS)
@@ -323,7 +328,7 @@ def pretrain(
             if verbose:
                 print(f"  eval @ {step}: val loss {val:.4f}  (ppl {math.exp(min(val, 20)):.1f})",
                       flush=True)
-            with open(log_path, "a") as f:
+            with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"step": step, "train_loss": total_loss,
                                     "val_loss": val, "lr": lr,
                                     "minutes": elapsed}) + "\n")
@@ -356,10 +361,7 @@ def pretrain(
     return ckpt_path
 
 
-BLANK_CHECKPOINT = Path("runs/blank/base.pt")
-
-
-def create_blank_checkpoint(path: str | Path = BLANK_CHECKPOINT,
+def create_blank_checkpoint(path: str | Path | None = None,
                             size: str = "small", block_size: int = 512,
                             seed: int = 1337, areas: int = 0,
                             area_scale: float = 1.0) -> Path:
@@ -374,7 +376,8 @@ def create_blank_checkpoint(path: str | Path = BLANK_CHECKPOINT,
     Expect babble for the first few thousand words of text, recognisable
     fragments of the source after a few tens of thousands.
     """
-    path = Path(path)
+    from .paths import blank_checkpoint
+    path = Path(path) if path is not None else blank_checkpoint()
     tok = BPETokenizer(merges=[])
     model_cfg = preset(size)
     model_cfg.vocab_size = tok.vocab_size

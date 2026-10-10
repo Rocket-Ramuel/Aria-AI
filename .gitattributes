@@ -1,0 +1,5 @@
+# Windows' cmd.exe misreads batch files with Unix line endings; shell scripts
+# need Unix ones whichever system they were checked out on.
+*.bat      text eol=crlf
+*.command  text eol=lf
+*.sh       text eol=lf

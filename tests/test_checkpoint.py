@@ -66,9 +66,19 @@ def test_default_search_order(tmp_path, monkeypatch):
 
 
 def test_no_checkpoint_anywhere_explains_itself(tmp_path, monkeypatch):
+    from aria import paths
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(paths, "shipped_checkpoint_candidates", lambda: [])
     with pytest.raises(FileNotFoundError, match="quickstart"):
         resolve_checkpoint(None)
+
+
+def test_the_shipped_model_is_found_from_any_folder(tmp_path, monkeypatch):
+    """An installed app, or `aria serve` typed in another folder, still finds
+    the model Aria ships with."""
+    monkeypatch.chdir(tmp_path)
+    found = resolve_checkpoint(None)
+    assert found.name == "aria-small.pt" and found.exists()
 
 
 # --- export ----------------------------------------------------------------

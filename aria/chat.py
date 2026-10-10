@@ -25,7 +25,8 @@ from .learner import (LearnProgress, OnlineLearner, Progress, StopCheck, UpdateR
                       drive, resume_learned_weights)
 from .model import grow, merge_lora
 from .storage import process_ram_mb
-from .pretrain import (BLANK_CHECKPOINT, create_blank_checkpoint, load_checkpoint,
+from .paths import adopt_old_blank, blank_checkpoint, memory_dir
+from .pretrain import (create_blank_checkpoint, load_checkpoint,
                        resolve_checkpoint)
 from .sample import build_chat_prompt, generate
 from .tokenizer import BPETokenizer
@@ -67,19 +68,21 @@ FileSource = Union[str, Path, bytes]
 def default_state_dir(checkpoint: str | Path) -> Path:
     """Where a checkpoint's learned weights and memories live by default.
 
-    Next to the checkpoint, so two different base models never share (and
-    corrupt) one memory. Every command that touches learner state resolves it
-    through here, so they all agree on where to look."""
-    return Path(checkpoint).parent / "online"
+    For the shipped model, Aria's per-user folder; for any other model, next
+    to it (see aria.paths.memory_dir). Every command that touches learner
+    state resolves it through here, so they all agree on where to look."""
+    return memory_dir(checkpoint)
 
 
 def resolve_session_checkpoint(checkpoint: str | Path | None, blank: bool) -> Path:
     if blank and not checkpoint:
-        if not BLANK_CHECKPOINT.exists():
-            create_blank_checkpoint(BLANK_CHECKPOINT)
-            print(f"created a blank model at {BLANK_CHECKPOINT}: it knows no "
+        adopt_old_blank()
+        path = blank_checkpoint()
+        if not path.exists():
+            create_blank_checkpoint(path)
+            print(f"created a blank model at {path}: it knows no "
                   f"words yet, so teach it with /upload or `aria teach`.")
-        return BLANK_CHECKPOINT
+        return path
     return resolve_checkpoint(checkpoint)
 
 

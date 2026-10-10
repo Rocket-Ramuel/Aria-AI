@@ -193,9 +193,10 @@ def _cmd_sample(args) -> int:
 
 
 def _checkpoint_for(args) -> Path:
-    from .pretrain import BLANK_CHECKPOINT, resolve_checkpoint
+    from .paths import blank_checkpoint
+    from .pretrain import resolve_checkpoint
     if getattr(args, "blank", False) and not args.checkpoint:
-        return BLANK_CHECKPOINT
+        return blank_checkpoint()
     return resolve_checkpoint(args.checkpoint)
 
 
@@ -219,7 +220,7 @@ def _cmd_status(args) -> int:
         "replay_size": len(replay),
         "replay_seen": replay.seen,
         "journal": journal.summary(),
-        "runtime": json.loads(runtime.read_text()) if runtime.exists() else None,
+        "runtime": json.loads(runtime.read_text(encoding="utf-8")) if runtime.exists() else None,
     }
     print(json.dumps(out, indent=2))
     return 0
@@ -257,8 +258,9 @@ def _cmd_teach(args) -> int:
 
 
 def _cmd_blank(args) -> int:
+    from .paths import blank_checkpoint
     from .pretrain import create_blank_checkpoint
-    out = Path(args.out)
+    out = Path(args.out) if args.out else blank_checkpoint()
     if out.exists() and not args.force:
         print(f"{out} already exists; pass --force to replace it "
               f"(its learned state in {out.parent / 'online'} is kept)")
@@ -274,7 +276,7 @@ def _cmd_blank(args) -> int:
 DEVICES = ["auto", "cpu", "cuda", "mps"]
 DEVICE_HELP = ("where to run: auto (default) picks an NVIDIA GPU (cuda), then an "
                "Apple Silicon GPU (mps), then the CPU")
-BLANK_HELP = ("use a model with no pretraining (created at runs/blank/base.pt "
+BLANK_HELP = ("use a model with no pretraining (created in Aria's data folder "
               "if needed) that learns only from what you upload and say")
 
 
@@ -384,6 +386,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_learner_flags(sv)
     sv.set_defaults(func=_cmd_serve)
 
+    # Parsed by aria.app itself (see main); listed here for --help.
+    sub.add_parser("app", help="open Aria as an app: a small window, and her chat in "
+                               "your browser (aria app --help for options)")
+
     sm = sub.add_parser("sample", parents=[common], help="free-form completion from a prompt")
     sm.add_argument("--checkpoint", default=None,
                    help="defaults to runs/aria/base.pt, then checkpoints/aria-small.pt")
@@ -443,7 +449,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     bl = sub.add_parser("blank", parents=[common],
                         help="create a model that knows nothing and learns only from you")
-    bl.add_argument("--out", default="runs/blank/base.pt")
+    bl.add_argument("--out", default=None,
+                    help="default: the blank model in Aria's data folder")
     bl.add_argument("--size", default="small", choices=["tiny", "small", "base"])
     bl.add_argument("--block-size", type=int, default=512,
                     help="context window in bytes")
@@ -479,6 +486,10 @@ def _add_learner_flags(parser: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["app"]:
+        from .app import main as app_main
+        return app_main(argv[1:])
     args = build_parser().parse_args(argv)
     if getattr(args, "threads", 0):
         torch.set_num_threads(args.threads)

@@ -21,6 +21,9 @@ pdf = ["pypdf>=4.0"]
 [project.scripts]
 aria = "aria.cli:main"
 
+[project.gui-scripts]
+aria-app = "aria.app:main"
+
 [project.urls]
 Homepage = "https://github.com/Rocket-Ramuel/Aria-AI"
 
@@ -28,7 +31,7 @@ Homepage = "https://github.com/Rocket-Ramuel/Aria-AI"
 packages = ["aria"]
 
 [tool.setuptools.package-data]
-aria = ["seed_dialogues.txt"]
+aria = ["seed_dialogues.txt", "icon.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

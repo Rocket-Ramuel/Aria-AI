@@ -324,10 +324,10 @@ def _rebuild_chat(data_dir: Path, block_size: int, n_surrogate: int,
         pickle.dump(chat, f)
 
     meta_path = data_dir / "meta.json"
-    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
     meta.update({"chat_examples": len(chat), "seed_repeat": seed_repeat,
                  "surrogate_dialogues": n_surrogate})
-    meta_path.write_text(json.dumps(meta, indent=2))
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     if verbose:
         print(f"rebuilt chat.pt: {len(chat)} examples "
               f"(seed x{seed_repeat}, {n_surrogate} surrogate)", flush=True)
@@ -413,7 +413,7 @@ def prepare(
         "corpus_chars": len(corpus),
         "sources": [p.name for p in paths],
     }
-    (data_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    (data_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     if verbose:
         print(json.dumps(meta, indent=2), flush=True)
     return meta
