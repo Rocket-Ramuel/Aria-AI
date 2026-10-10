@@ -33,9 +33,10 @@ CHOICES = ("auto", "cpu", "cuda", "mps")
 # Chatting with a small model, an Apple GPU is slower than the CPU: each word
 # is a few dozen tiny steps, and handing each one to the GPU costs more than
 # the step itself. On GitHub's Apple Silicon machines the shipped 6.5M-parameter
-# model took 50 s to start on the GPU and 2.5 s to answer, against 3 s and
-# 0.1 s on a CPU. So for a model smaller than this, `auto` leaves the Apple GPU
-# alone; `--device mps` still uses it.
+# model took 2.5 s to answer on the GPU against 0.1 s on the same machine's
+# CPU, and 10-13 s to read a short document against 3-4 s. So for a model
+# smaller than this, `auto` leaves the Apple GPU alone; `--device mps` still
+# uses it.
 MPS_MIN_PARAMS = 50_000_000
 _verified: dict[str, str | None] = {}     # device -> None if fine, else the error
 

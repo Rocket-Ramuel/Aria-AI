@@ -69,6 +69,18 @@ def test_quit_and_hello_routes():
         server.close()
 
 
+def test_starting_needs_no_network_name_lookup(monkeypatch):
+    # Python's web server looks up its address's network name as it starts,
+    # which took ~35 s on GitHub's Macs. Aria's server doesn't.
+    import socket
+
+    def no_lookup(*a, **k):
+        raise AssertionError("looked up a network name")
+    monkeypatch.setattr(socket, "getfqdn", no_lookup)
+    server = build_server(port=0)
+    server.close()
+
+
 def test_autosave_saves_only_what_changed():
     server = build_server(port=0)
     try:

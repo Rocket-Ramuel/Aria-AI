@@ -32,6 +32,7 @@ import os
 import queue
 import re
 import shutil
+import socketserver
 import sys
 import threading
 import uuid
@@ -780,6 +781,12 @@ class _HTTPServer(ThreadingHTTPServer):
     # On Windows SO_REUSEADDR lets a second server bind a port that is
     # already in use, and the two then split the requests between them.
     allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        # HTTPServer would look up the address's network name here, which on
+        # some Macs waits ~35 s for a reply that never comes. Nothing uses it.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 class _Handler(BaseHTTPRequestHandler):

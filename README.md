@@ -280,10 +280,10 @@ supported GPU and use the CPU. Two things to know:
 - The shipped model runs on the **CPU**, even on a Mac with an Apple GPU,
   because there it's faster: she's small enough that handing each word to the
   GPU and back costs far more than the work itself. On GitHub's Apple Silicon
-  machines the shipped model took 50 seconds to start on the GPU and 2.5 to
-  answer, against 3 seconds and a tenth of a second on a CPU. A model of 50
-  million parameters or more (one you trained or grew) uses the GPU. To try
-  the GPU anyway, `--device mps`.
+  machines the shipped model took 2.5 seconds to answer on the GPU and a tenth
+  of a second on the same machine's CPU, and 10–13 seconds to read a short
+  document against 3–4. A model of 50 million parameters or more (one you
+  trained or grew) uses the GPU. To try the GPU anyway, `--device mps`.
 - A MacBook Air has no fan. Under a long upload — on the GPU or the CPU — it
   slows itself down to stay cool, which is normal and harmless but caps how
   fast big jobs go. Plug in for big uploads; they use the battery heavily.
@@ -934,7 +934,7 @@ aria/
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
   icon.png                  the app icon (drawn by packaging/make_icon.py)
-tests/           232 tests
+tests/           233 tests
 packaging/       how the app is built: PyInstaller recipe, Windows installer, icon
 .github/workflows/apps.yml  builds and tests the Mac, Windows and Linux apps
 Start Aria (Mac).command, Start Aria (Windows).bat, start-aria-linux.sh
