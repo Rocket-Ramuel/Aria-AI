@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from aria import chat as chat_mod
-from aria.chat import ChatSession, _command, _dropped_file
+from aria.chat import ChatSession, _command, _dropped_file, _split
 from aria.config import LearnerConfig, ModelConfig
 from aria.documents import iter_lines
 from aria.learner import HOLDOUT_EVERY, HOLDOUT_SEGMENT, OnlineLearner
@@ -174,6 +174,15 @@ def test_dragged_paths_are_recognised(tmp_path):
     assert _dropped_file(f"{doc} and more") is None
     (tmp_path / "song.mp3").write_bytes(b"x")
     assert _dropped_file(str(tmp_path / "song.mp3")) is None
+
+
+def test_windows_paths_keep_their_backslashes():
+    # Checked on every system: on Windows a backslash separates folders.
+    assert _split(r"C:\Users\sam\notes.txt", windows=True) == [r"C:\Users\sam\notes.txt"]
+    assert _split(r'"C:\Users\Sam Smith\chat.txt" as Jo', windows=True) == \
+        [r"C:\Users\Sam Smith\chat.txt", "as", "Jo"]
+    assert _split(r"'D:\my docs\a.txt'", windows=True) == [r"D:\my docs\a.txt"]
+    assert _split("'/Users/sam/my notes.txt'", windows=False) == ["/Users/sam/my notes.txt"]
 
 
 def test_upload_command_asks_whose_voice_to_learn(session, tmp_path, monkeypatch, capsys):

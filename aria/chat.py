@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import os
 import shlex
 import signal
 import sys
@@ -116,18 +117,17 @@ class ChatSession:
         blank: bool = False,
     ) -> None:
         from .device import resolve
-        device = resolve(device)
         checkpoint = resolve_session_checkpoint(checkpoint, blank)
         self.checkpoint = checkpoint
         self.state_dir = Path(state_dir or default_state_dir(checkpoint))
-        self.device = device
         self.learning = learning
         self.verbose = verbose
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
 
-        self.model, self.tok, self.cfg, ckpt = load_checkpoint(checkpoint, device)
+        # Loaded on the CPU first: which device suits her depends on her size.
+        self.model, self.tok, self.cfg, ckpt = load_checkpoint(checkpoint, "cpu")
         # Layers the checkpoint came with; any above this were grown.
         self.base_layers = self.model.cfg.n_layer
         # Text the checkpoint was already trained on counts toward how full
@@ -137,7 +137,10 @@ class ChatSession:
             * self.cfg.model.block_size
         # A byte-level model spends several tokens per word.
         self.max_new_tokens = max_new_tokens or (96 if self.tok.merges else 240)
-        restored = resume_learned_weights(self.model, self.state_dir, device)
+        restored = resume_learned_weights(self.model, self.state_dir, "cpu")
+        device = resolve(device, n_params=self.model.num_params())
+        self.model.to(device)
+        self.device = device
 
         # Command-line overrides apply on top of the config the checkpoint
         # carries, so a blank model keeps its blank-model learner settings.
@@ -147,7 +150,6 @@ class ChatSession:
         if cfg.pretrain_replay_frac > 0:
             stream = _matching_corpus(Path(data_dir), self.tok, self.model.cfg.block_size)
 
-        self.device = device
         self._learner_cfg, self._stream = cfg, stream
         # Kept only where EWC uses it, for rebuilding the learner after growth.
         self._fisher = ckpt.get("fisher") if cfg.plasticity != "lora" else None
@@ -397,7 +399,8 @@ def run(session: ChatSession, banner: bool = True) -> None:
 
         dropped = _dropped_file(line)
         if dropped is not None:
-            line = "/upload " + shlex.quote(str(dropped))
+            _upload_file(session, dropped, None, interactive=True)
+            continue
         if line.startswith("/"):
             if _command(session, line, interactive=True):
                 break
@@ -416,10 +419,20 @@ def run(session: ChatSession, banner: bool = True) -> None:
     print("saved. goodbye.")
 
 
+def _split(text: str, windows: bool = os.name == "nt") -> list[str]:
+    """Split a line into words the way a shell quotes them. On Windows a
+    backslash separates folders (C:\\Users\\...) rather than escaping the next
+    character, so only the quotes around a word are removed."""
+    if not windows:
+        return shlex.split(text)
+    return [w[1:-1] if len(w) >= 2 and w[0] == w[-1] and w[0] in "\"'" else w
+            for w in shlex.split(text, posix=False)]
+
+
 def _dropped_file(line: str) -> Path | None:
     """A file dragged into the terminal arrives as its (often quoted) path."""
     try:
-        words = shlex.split(line)
+        words = _split(line)
     except ValueError:
         return None
     if len(words) != 1:
@@ -450,7 +463,7 @@ def _ctrl_c_stops():
 
 def _upload_command(session: ChatSession, arg: str, interactive: bool) -> None:
     try:
-        words = shlex.split(arg)
+        words = _split(arg)
     except ValueError as e:
         print(f"  {e}")
         return
@@ -460,7 +473,11 @@ def _upload_command(session: ChatSession, arg: str, interactive: bool) -> None:
     if len(words) != 1:
         print("  usage: /upload <file> [as <speaker name>]")
         return
-    path = Path(words[0]).expanduser()
+    _upload_file(session, Path(words[0]).expanduser(), speaker, interactive)
+
+
+def _upload_file(session: ChatSession, path: Path, speaker: str | None,
+                 interactive: bool) -> None:
     try:
         names, _ = session.sniff(path, path.name)
         if names and speaker is None and interactive:

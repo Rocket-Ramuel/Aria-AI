@@ -42,14 +42,17 @@ def generate(
     repetition_penalty: float = 1.12,
     no_repeat_window: int = 64,
     stop_ids: Sequence[int] = (),
-    device: torch.device | str = "cpu",
+    device: torch.device | str | None = None,
     memory=None,
 ) -> Iterator[int]:
     """Yield generated token ids one at a time.
 
     The prompt is truncated from the left to fit the context window, so a long
-    conversation degrades into a sliding window rather than raising.
+    conversation degrades into a sliding window rather than raising. `device`
+    defaults to wherever the model is.
     """
+    if device is None:
+        device = next(model.parameters()).device
     model.eval()
     block = model.cfg.block_size
     ids = list(prompt_ids)[-(block - 1):]
@@ -113,7 +116,7 @@ def complete(
     model: GPT,
     tok: BPETokenizer,
     prompt: str,
-    device: torch.device | str = "cpu",
+    device: torch.device | str | None = None,
     **kwargs,
 ) -> str:
     ids = tok.encode(prompt)

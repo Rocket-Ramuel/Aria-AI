@@ -47,10 +47,15 @@ jobs:
         include:
           - name: Mac
             os: macos-latest
+            main: Aria-Mac.dmg
+            extra: Aria-Mac.zip
           - name: Windows
             os: windows-latest
+            main: Aria-Windows-Setup.exe
+            extra: Aria-Windows.zip
           - name: Linux
             os: ubuntu-22.04
+            main: Aria-Linux.tar.gz
             # Without this, pip fetches the NVIDIA build: gigabytes of GPU
             # libraries the app would carry around for nothing.
             torch_index: https://download.pytorch.org/whl/cpu
@@ -89,6 +94,26 @@ jobs:
           else
             python -m aria app --self-test --require-window
           fi
+
+      - name: "Mac: Aria on the Apple GPU"
+        if: runner.os == 'macOS'
+        env:
+          ARIA_HOME: ${{ runner.temp }}/apple-gpu
+        run: |
+          python - <<'EOF'
+          import sys
+          from aria.device import mps_available, self_test
+          if not mps_available():
+              print("this build machine has no Apple GPU; skipped")
+              sys.exit(0)
+          problem = self_test("mps")
+          assert problem is None, problem
+          from aria.chat import ChatSession
+          s = ChatSession(device="mps", max_new_tokens=12)
+          reply, report = s.turn("hello there, how are you?")
+          s.save()
+          print(f"on the {s.device}: {reply!r}; {report.line()}")
+          EOF
 
       - name: Build the app
         run: pyinstaller --noconfirm --clean packaging/aria.spec
@@ -180,10 +205,19 @@ jobs:
       - name: Sizes
         run: ls -la out
 
+      # One download per file, so nobody has to fetch two copies of the app.
       - uses: actions/upload-artifact@v4
         with:
-          name: Aria-${{ matrix.name }}
-          path: out/*
+          name: ${{ matrix.main }}
+          path: out/${{ matrix.main }}
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.extra
+        with:
+          name: ${{ matrix.extra }}
+          path: out/${{ matrix.extra }}
           compression-level: 0
           if-no-files-found: error
 

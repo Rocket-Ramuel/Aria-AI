@@ -37,6 +37,19 @@ def test_auto_prefers_nvidia_then_apple(monkeypatch):
     assert dev.resolve("auto") == "mps"
 
 
+def test_a_small_model_chats_on_a_macs_cpu(monkeypatch):
+    """The Apple GPU is slower than the CPU for a small model; only a large one
+    (or asking for it) uses it."""
+    monkeypatch.setattr(dev, "self_test", lambda d: None)
+    monkeypatch.setattr(dev, "mps_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert dev.resolve("auto", n_params=6_500_000) == "cpu"
+    assert dev.resolve("auto", n_params=dev.MPS_MIN_PARAMS) == "mps"
+    assert dev.resolve("mps", n_params=6_500_000) == "mps"
+    from aria.chat import ChatSession
+    assert ChatSession(max_new_tokens=4).device == "cpu"        # the shipped model
+
+
 def test_a_gpu_that_fails_its_self_test_falls_back_to_cpu(monkeypatch, capsys):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(dev, "mps_available", lambda: True)
@@ -76,8 +89,9 @@ def test_saved_weights_are_on_the_cpu_so_they_load_anywhere(tmp_path):
     from aria.chat import ChatSession
     from aria.pretrain import create_blank_checkpoint
     ckpt = create_blank_checkpoint(tmp_path / "b" / "base.pt", size="tiny", block_size=64)
+    # Wherever she runs (an Apple or NVIDIA GPU where there is one), what she
+    # saves is on the CPU.
     s = ChatSession(checkpoint=ckpt, max_new_tokens=4)
-    assert s.device == "cpu"
     s.turn("hello there")
     s.save()
     state = torch.load(s.state_dir / "learned.pt", weights_only=True)

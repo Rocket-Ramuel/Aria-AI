@@ -262,7 +262,7 @@ Every command takes `--device`, and the default, `auto`, picks for you:
 
 1. an **NVIDIA GPU** (`cuda`), if PyTorch was installed with CUDA support;
 2. the **GPU of an Apple Silicon Mac** (`mps`) — any M1, M2, M3 or M4 Mac,
-   including a MacBook Air;
+   including a MacBook Air — for a model of 50 million parameters or more;
 3. otherwise the **CPU**.
 
 `aria serve` prints which it chose ("running on the Apple GPU"). Before a GPU
@@ -277,20 +277,25 @@ operation the Apple GPU lacks on the CPU instead of failing.
 includes Apple GPU support) and run `aria serve` as usual. Intel Macs have no
 supported GPU and use the CPU. Two things to know:
 
-- For chatting, the GPU isn't necessarily faster: Aria is small enough that
-  handing each word to the GPU and back can cost as much as it saves. It helps
-  most with big uploads. To compare on your machine, try `--device cpu` and
-  `--device mps` on the same upload.
+- The shipped model runs on the **CPU**, even on a Mac with an Apple GPU,
+  because there it's faster: she's small enough that handing each word to the
+  GPU and back costs far more than the work itself. On GitHub's Apple Silicon
+  machines the shipped model took 50 seconds to start on the GPU and 2.5 to
+  answer, against 3 seconds and a tenth of a second on a CPU. A model of 50
+  million parameters or more (one you trained or grew) uses the GPU. To try
+  the GPU anyway, `--device mps`.
 - A MacBook Air has no fan. Under a long upload — on the GPU or the CPU — it
   slows itself down to stay cool, which is normal and harmless but caps how
   fast big jobs go. Plug in for big uploads; they use the battery heavily.
 
 **Tested:** the device selection, the self-test and the fallback are covered
-by the test suite (with GPUs simulated), and everything was measured on a CPU.
-Aria has **not yet been run on a real Apple GPU**. The parts known to differ
-on one were made safe (weights load through the CPU, the optimiser's momentum
-stays 32-bit there, 16-bit arithmetic is off there), and the self-test is the
-backstop. If something goes wrong on your Mac, the message says what.
+by the test suite (with GPUs simulated), and Aria — loading, chatting,
+reading a document, saving and reloading — has run on a real Apple GPU, on
+GitHub's Apple Silicon build machines, which check it on every build. The parts
+known to differ there were made safe (weights load through the CPU, the
+optimiser's momentum stays 32-bit there, 16-bit arithmetic is off there), and
+the self-test is the backstop. If something goes wrong on your Mac, the
+message says what.
 
 ### How slow is CPU, really?
 
@@ -929,7 +934,7 @@ aria/
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
   icon.png                  the app icon (drawn by packaging/make_icon.py)
-tests/           230 tests
+tests/           232 tests
 packaging/       how the app is built: PyInstaller recipe, Windows installer, icon
 .github/workflows/apps.yml  builds and tests the Mac, Windows and Linux apps
 Start Aria (Mac).command, Start Aria (Windows).bat, start-aria-linux.sh

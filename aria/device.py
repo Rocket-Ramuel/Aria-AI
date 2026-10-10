@@ -4,7 +4,7 @@
 
 1. ``cuda`` — an NVIDIA GPU with the CUDA build of PyTorch;
 2. ``mps``  — the GPU of an Apple Silicon Mac (M1 or newer), through
-   PyTorch's Metal backend;
+   PyTorch's Metal backend, for a model big enough to gain from it;
 3. ``cpu``  — always available.
 
 A GPU is put through a short self-test before it is trusted: a tiny model
@@ -29,6 +29,14 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import torch  # noqa: E402
 
 CHOICES = ("auto", "cpu", "cuda", "mps")
+
+# Chatting with a small model, an Apple GPU is slower than the CPU: each word
+# is a few dozen tiny steps, and handing each one to the GPU costs more than
+# the step itself. On GitHub's Apple Silicon machines the shipped 6.5M-parameter
+# model took 50 s to start on the GPU and 2.5 s to answer, against 3 s and
+# 0.1 s on a CPU. So for a model smaller than this, `auto` leaves the Apple GPU
+# alone; `--device mps` still uses it.
+MPS_MIN_PARAMS = 50_000_000
 _verified: dict[str, str | None] = {}     # device -> None if fine, else the error
 
 
@@ -83,8 +91,10 @@ def self_test(device: str) -> str | None:
     return result
 
 
-def resolve(requested: str | None = "auto", verbose: bool = True) -> str:
-    """The device to run on, for a `--device` value."""
+def resolve(requested: str | None = "auto", verbose: bool = True,
+            n_params: int | None = None) -> str:
+    """The device to run on, for a `--device` value. `n_params`: the size of
+    the model to be chatted with, if known (see MPS_MIN_PARAMS)."""
     requested = (requested or "auto").lower()
     if kind(requested) not in CHOICES:
         raise ValueError(f"unknown device {requested!r}; choose from {', '.join(CHOICES)}")
@@ -93,7 +103,7 @@ def resolve(requested: str | None = "auto", verbose: bool = True) -> str:
         candidates = []
         if torch.cuda.is_available():
             candidates.append("cuda")
-        if mps_available():
+        if mps_available() and (n_params is None or n_params >= MPS_MIN_PARAMS):
             candidates.append("mps")
     elif requested == "cpu":
         return "cpu"
