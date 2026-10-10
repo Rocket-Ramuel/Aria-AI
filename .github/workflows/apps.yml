@@ -133,7 +133,10 @@ jobs:
         if: runner.os == 'macOS'
         env:
           ARIA_HOME: ${{ runner.temp }}/self-test-app
-        run: dist/Aria.app/Contents/MacOS/Aria --self-test --require-window
+        run: |
+          dist/Aria.app/Contents/MacOS/Aria --self-test --require-window
+          echo "--- again: the second start, as after the first time she's opened"
+          ARIA_HOME="$ARIA_HOME-2" dist/Aria.app/Contents/MacOS/Aria --self-test --require-window
 
       - name: "Mac: package"
         if: runner.os == 'macOS'

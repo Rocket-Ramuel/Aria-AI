@@ -63,7 +63,7 @@ def test_quit_and_hello_routes():
             post(url + "/api/quit", {}, {"Origin": "https://evil.example"})
         assert e.value.code == 403 and not asked.is_set()
         assert json.loads(post(url + "/api/quit", {})[1]) == {"ok": True}
-        assert asked.is_set()
+        assert asked.wait(5)            # answered first, then asked to quit
     finally:
         server.httpd.shutdown()
         server.close()
