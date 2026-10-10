@@ -829,6 +829,17 @@ class _Handler(BaseHTTPRequestHandler):
             raise ValueError("expected a JSON object")
         return body
 
+    def _discard_body(self, limit: int = 1 << 20) -> None:
+        """Read a request body that isn't needed. A connection closed with
+        unread data in it is reset instead of closed, and on Windows the
+        reply can be lost with it, so even a `{}` has to be read."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if 0 < n <= limit:
+            self.rfile.read(n)
+
     def _trusted(self) -> bool:
         """Is this request from the Aria page itself, not another site?"""
         if _hostname(self.headers.get("Host", "")) not in self.allowed_hosts:
@@ -879,6 +890,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if not self._trusted():
+            self._discard_body()
             self._refuse()
             return
         route = self.route
@@ -886,6 +898,7 @@ class _Handler(BaseHTTPRequestHandler):
         cancel = _CANCEL_ROUTE.match(route)
         expected = "application/octet-stream" if route in self.RAW_ROUTES else "application/json"
         if ctype != expected:
+            self._discard_body()
             self._json({"error": f"expected Content-Type: {expected}"}, 415)
             return
         if route == "/api/chat":
@@ -899,12 +912,15 @@ class _Handler(BaseHTTPRequestHandler):
         elif route == "/api/inspect":
             self._inspect()
         elif cancel:
+            self._discard_body()
             ok = self.app.jobs.cancel(cancel.group(1))
             self._json({"ok": ok}, 200 if ok else 404)
         elif route == "/api/quit" and self.app.on_quit is not None:
+            self._discard_body()
             self._json({"ok": True})
             self.app.on_quit()
         else:
+            self._discard_body()
             self._json({"error": "not found"}, 404)
 
     def _event(self, obj: Any) -> None:
@@ -1021,6 +1037,7 @@ class _Handler(BaseHTTPRequestHandler):
         name = Path(q.get("name") or "upload.txt").name or "upload.txt"
         suffix = suffix_of(name)
         if suffix not in SUPPORTED_SUFFIXES:
+            self._discard_body()
             self._json({"error": f"can't read {suffix or 'extension-less'} files; use one "
                                  f"of {', '.join(SUPPORTED_SUFFIXES)}"}, 415)
             return
@@ -1029,6 +1046,7 @@ class _Handler(BaseHTTPRequestHandler):
             if passes is not None and passes < 1:
                 raise ValueError
         except ValueError:
+            self._discard_body()
             self._json({"error": "passes must be a positive whole number"}, 400)
             return
         if self.headers.get("Content-Length") is None:

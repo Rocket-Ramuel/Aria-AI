@@ -281,8 +281,7 @@ class Window:
         frame.grid(sticky="nsew")
         ttk.Label(frame, text="Aria", font=title_font).grid(
             row=0, column=0, columnspan=2, sticky="w")
-        self.status = ttk.Label(frame, text="Starting Aria… The first time after "
-                                "installing her can take a minute.", width=46,
+        self.status = ttk.Label(frame, text="Starting Aria…", width=46,
                                 wraplength=340, justify="left")
         self.status.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 14))
         self.open_btn = ttk.Button(frame, text="Open chat", state="disabled",

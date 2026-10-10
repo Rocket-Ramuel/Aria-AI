@@ -81,6 +81,38 @@ def test_starting_needs_no_network_name_lookup(monkeypatch):
     server.close()
 
 
+def test_every_request_body_is_read(monkeypatch):
+    """A reply sent with the request still unread can be lost on Windows: the
+    connection is reset instead of closed. Seen there as WinError 10053."""
+    import http.client
+    import io
+    from aria.serve import App, make_handler
+
+    app_ = App({"default": {"label": "x"}}, "default")
+    app_.on_quit = lambda: None
+    handler = make_handler(app_)
+    body = b'{"x": 1}'
+    try:
+        for route, ctype in (("/api/quit", "application/json"),
+                             ("/api/jobs/" + "0" * 32 + "/cancel", "application/json"),
+                             ("/api/nowhere", "application/json"),
+                             ("/api/chat", "text/plain"),
+                             ("/api/upload?name=song.mp3", "application/octet-stream")):
+            h = handler.__new__(handler)
+            h.rfile, h.wfile = io.BytesIO(body), io.BytesIO()
+            h.path, h.command = route, "POST"
+            h.request_version, h.requestline = "HTTP/1.1", f"POST {route} HTTP/1.1"
+            h.client_address = ("127.0.0.1", 0)
+            h.headers = http.client.parse_headers(io.BytesIO(
+                f"Host: 127.0.0.1\r\nContent-Type: {ctype}\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n".encode()))
+            h.do_POST()
+            assert h.rfile.tell() == len(body), f"{route} left its body unread"
+            assert h.wfile.getvalue().startswith(b"HTTP/1.0 ")
+    finally:
+        app_.jobs.stop()
+
+
 def test_autosave_saves_only_what_changed():
     server = build_server(port=0)
     try:
