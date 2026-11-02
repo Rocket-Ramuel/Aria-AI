@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 
 # Must be set before PyTorch's Metal backend starts; harmless elsewhere.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -43,7 +44,14 @@ _verified: dict[str, str | None] = {}     # device -> None if fine, else the err
 
 def mps_available() -> bool:
     backend = getattr(torch.backends, "mps", None)
-    return bool(backend and backend.is_available())
+    if backend is None:
+        return False
+    # A Mac whose graphics can't run Metal 2 (some virtual machines) has no
+    # usable Apple GPU, and PyTorch warns as it finds that out. Answering the
+    # question is all that's needed here.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return bool(backend.is_available())
 
 
 def kind(device: str | torch.device) -> str:

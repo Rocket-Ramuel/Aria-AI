@@ -28,6 +28,19 @@ def test_auto_without_a_gpu_is_cpu(monkeypatch):
     assert dev.resolve("auto") == "cpu"
 
 
+def test_a_mac_without_a_usable_gpu_is_asked_quietly(monkeypatch):
+    # Seen on one of GitHub's Macs: "Skipping device Apple Paravirtual device
+    # that does not support Metal 2.0", which the test settings make an error.
+    import warnings
+
+    def warns():
+        warnings.warn("Skipping device Apple Paravirtual device that does not "
+                      "support Metal 2.0", UserWarning)
+        return False
+    monkeypatch.setattr(torch.backends.mps, "is_available", warns)
+    assert dev.mps_available() is False
+
+
 def test_auto_prefers_nvidia_then_apple(monkeypatch):
     monkeypatch.setattr(dev, "self_test", lambda d: None)
     monkeypatch.setattr(dev, "mps_available", lambda: True)
