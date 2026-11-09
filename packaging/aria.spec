@@ -27,7 +27,8 @@ a = Analysis(
         (str(ROOT / "aria" / "seed_dialogues.txt"), "aria"),
         (str(ICON), "aria"),
     ],
-    hiddenimports=collect_submodules("aria"),
+    # The Raspberry Pi edition (aria.pi) isn't part of the desktop apps.
+    hiddenimports=[m for m in collect_submodules("aria") if m != "aria.pi"],
     # Things that may be installed on the build machine but Aria never uses.
     excludes=["PIL", "matplotlib", "IPython", "jupyter", "notebook", "pandas",
               "scipy", "pytest", "torchvision", "torchaudio", "tensorboard"],

@@ -172,6 +172,14 @@ the place to look if she won't start.
 it starts her in a temporary folder, chats, reads a document, saves, quits and
 reloads, and reports each step.
 
+### On a Raspberry Pi
+
+A separate edition runs her all the time on a Raspberry Pi (a Pi 5 or Pi 4
+with 4 GB or more), starting by herself whenever it does, so every computer
+and phone at home talks to the same Aria in a browser. It saves every five
+minutes and whenever it's stopped. One script sets it up:
+[raspberry-pi/README.md](raspberry-pi/README.md) has the steps.
+
 ### Talk to her straight away
 
 A trained model ships in the repo, so there is nothing to train before you can
@@ -930,6 +938,7 @@ aria/
   chat.py        REPL
   serve.py       local browser UI and background learning (standard library only)
   app.py         the desktop app: its window, one-at-a-time, autosave, --self-test
+  pi.py          the Raspberry Pi edition: always on, for the whole network
   paths.py       where her memory lives on each system
   cli.py         command line
   seed_dialogues.txt        hand-written conversation seed
@@ -937,6 +946,8 @@ aria/
 tests/           233 tests
 packaging/       how the app is built: PyInstaller recipe, Windows installer, icon
 .github/workflows/apps.yml  builds and tests the Mac, Windows and Linux apps
+raspberry-pi/    the Raspberry Pi edition's installer and instructions
+.github/workflows/raspberry-pi.yml  installs and tests it on a 64-bit ARM machine
 Start Aria (Mac).command, Start Aria (Windows).bat, start-aria-linux.sh
                  double-click starters for running from this folder
 notebooks/       Colab notebook for a free GPU

@@ -1,0 +1,68 @@
+# Checks the Raspberry Pi edition on the same kind of chip a Pi has (64-bit
+# ARM), set up the way someone would on a Pi: run raspberry-pi/install.sh,
+# talk to her from "another computer" by this machine's network address,
+# restart her as a reboot would, and check that she saved what she learned.
+# Separate from the desktop apps' workflow (apps.yml).
+
+name: Raspberry Pi
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "aria/**"
+      - "checkpoints/**"
+      - "raspberry-pi/**"
+      - "tests/**"
+      - "requirements.txt"
+      - ".github/workflows/raspberry-pi.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: raspberry-pi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pi:
+    name: 64-bit ARM, as on a Raspberry Pi
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install, exactly as on a Pi
+        timeout-minutes: 25
+        run: ./raspberry-pi/install.sh
+
+      - name: Talk to her from another computer on the network
+        run: |
+          ip=$(hostname -I | awk '{print $1}')
+          echo "this machine's address: $ip"
+          curl -sf "http://$ip:8000/api/hello"; echo
+          curl -sf -X POST -H 'Content-Type: application/json' \
+            -d '{"message": "hello from my phone"}' "http://$ip:8000/api/chat" | tee reply.txt
+          grep -q '"token"' reply.txt
+          # A request addressed to some other name is refused.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' "http://$ip:8000/api/hello")
+          test "$code" = 403
+
+      - name: Restart her, as a reboot would, and check she saved first
+        run: |
+          sudo systemctl restart aria
+          for _ in $(seq 1 120); do
+            curl -sf http://127.0.0.1:8000/api/hello >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8000/api/hello; echo
+          sudo journalctl -u aria --no-pager | grep -q "saved; Aria has stopped"
+          test -f ~/.local/share/aria/online/learned.pt
+
+      - name: The full test suite, on ARM
+        run: .venv/bin/python -m pytest -q
+
+      - name: What she said
+        if: always()
+        run: sudo journalctl -u aria --no-pager -n 60 || true

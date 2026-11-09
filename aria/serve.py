@@ -215,7 +215,7 @@ function stopped(text) {
 function lost() {
   stopped(APP_MODE
     ? "Aria isn't running. Open the Aria app to talk to her again \\u2014 she remembers what she learned."
-    : "Can't reach Aria. Is the server (python -m aria serve) still running?");
+    : "Can't reach Aria. Is the computer she runs on switched on, with her running?");
 }
 function back() {
   if (quitted || !document.body.classList.contains('offline')) return;

@@ -18,6 +18,11 @@ the download works. "Processor: Intel" means the app can't run there; use the
 The `.zip` files hold the same Mac and Windows apps, for anyone who prefers a
 zip to a disk image or an installer.
 
+**Raspberry Pi:** there's no download; a separate edition installs from the
+source code with one script and runs her all the time for your whole home
+network. See
+[raspberry-pi/README.md](https://github.com/Rocket-Ramuel/Aria-AI/blob/claude/keen-einstein-9cy5rx/raspberry-pi/README.md).
+
 ## The first time you open her
 
 She isn't signed with a paid Apple or Microsoft certificate, so your computer
