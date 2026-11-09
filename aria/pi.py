@@ -70,7 +70,7 @@ class Names:
 
     def current(self) -> frozenset[str]:
         with self._lock:
-            if time.monotonic() - self._when > ADDRESS_REFRESH_SECONDS:
+            if time.monotonic() - self._when >= ADDRESS_REFRESH_SECONDS:
                 self._addresses = local_addresses()
                 self._when = time.monotonic()
             return frozenset(self.fixed | self._addresses)
