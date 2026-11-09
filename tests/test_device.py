@@ -109,3 +109,36 @@ def test_saved_weights_are_on_the_cpu_so_they_load_anywhere(tmp_path):
     s.save()
     state = torch.load(s.state_dir / "learned.pt", weights_only=True)
     assert all(v.device.type == "cpu" for v in state["model"].values())
+
+
+def test_bfloat16_is_tried_in_another_process_before_it_is_trusted(monkeypatch):
+    """A CPU can claim bfloat16 and die of an illegal instruction using it (seen
+    on GitHub's Windows machines with PyTorch 2.15): that must take down a
+    throwaway process, not Aria, and be remembered."""
+    import subprocess
+    import sys
+    dev._bf16_works.clear()
+    crash = [sys.executable, "-c", "import os; os.abort()"]
+    monkeypatch.setattr(dev, "_check_command", lambda: (crash, None))
+    assert dev.cpu_bf16_works() is False
+    dev._bf16_works.clear()                         # as in a new session
+
+    def must_not_run(*a, **k):
+        raise AssertionError("checked again")
+    monkeypatch.setattr(subprocess, "run", must_not_run)
+    assert dev.cpu_bf16_works() is False            # remembered on disk
+
+
+def test_a_cpu_that_runs_bfloat16_passes_the_check(monkeypatch):
+    import sys
+    dev._bf16_works.clear()
+    monkeypatch.setattr(dev, "_check_command",
+                        lambda: ([sys.executable, "-c", "pass"], None))
+    assert dev.cpu_bf16_works() is True
+
+
+def test_the_real_check_runs_in_its_own_process():
+    # Never call check_bf16_here() directly here: on a CPU that can't do it,
+    # that would end the test run itself.
+    dev._bf16_works.clear()
+    assert dev.cpu_bf16_works() in (True, False)

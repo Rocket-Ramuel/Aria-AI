@@ -20,9 +20,13 @@ than fatal.
 
 from __future__ import annotations
 
+import json
 import os
+import platform
+import subprocess
 import sys
 import warnings
+from pathlib import Path
 
 # Must be set before PyTorch's Metal backend starts; harmless elsewhere.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -145,3 +149,90 @@ def _name(device: str) -> str:
 def _say(verbose: bool, message: str) -> None:
     if verbose:
         print(f"aria: {message}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# bfloat16 on the CPU
+# ---------------------------------------------------------------------------
+
+CHECK_BF16_FLAG = "--check-bfloat16"
+_bf16_works: dict[str, bool] = {}
+
+
+def check_bf16_here() -> None:
+    """A miniature of Aria learning in bfloat16 on the CPU. Run in a separate
+    process by cpu_bf16_works: if the CPU can't really do it, that process
+    dies, not Aria."""
+    from .config import ModelConfig
+    from .model import GPT
+    torch.manual_seed(0)
+    model = GPT(ModelConfig(vocab_size=64, n_layer=1, n_head=2, n_kv_head=1,
+                            n_embd=64, block_size=32, n_areas=2))
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    x = torch.randint(0, 64, (4, 32))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss = model(x, x)[1]
+        big = torch.nn.Linear(512, 2048)(torch.randn(64, 512))
+    (loss + big.float().mean()).backward()
+    opt.step()
+
+
+def _check_command() -> tuple[list[str], str | None]:
+    """How to run check_bf16_here in a new process, and in which folder."""
+    if getattr(sys, "frozen", False):           # the packaged app
+        return [sys.executable, "--aria-check-bfloat16"], None   # packaging/aria_app.py
+    return ([sys.executable, "-m", "aria.device", CHECK_BF16_FLAG],
+            str(Path(__file__).resolve().parent.parent))
+
+
+def _cpu_name() -> str:
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor()
+
+
+def cpu_bf16_works() -> bool:
+    """Whether bfloat16 arithmetic really runs on this CPU.
+
+    A CPU can say it has bfloat16 instructions and still not run them (seen
+    on one of GitHub's Windows machines with PyTorch 2.15). That isn't an
+    error Aria could catch: it's an "illegal instruction" that ends the whole
+    program. So it's tried once in a separate process, and the answer kept
+    for this PyTorch and this processor."""
+    from .paths import data_dir
+    key = f"{torch.__version__} {platform.machine()} {_cpu_name()}"
+    if key in _bf16_works:
+        return _bf16_works[key]
+    cache = data_dir() / "cpu-check.json"
+    try:
+        known = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        known = {}
+    if key not in known:
+        cmd, cwd = _check_command()
+        try:
+            known[key] = subprocess.run(cmd, cwd=cwd, capture_output=True,
+                                        timeout=300).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            known[key] = False
+        if not known[key]:
+            _say(True, "this CPU says it can do bfloat16 arithmetic but can't run "
+                       "it here, so learning stays in float32")
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(known, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    _bf16_works[key] = bool(known[key])
+    return _bf16_works[key]
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == [CHECK_BF16_FLAG]:
+        check_bf16_here()
+        sys.exit(0)
+    sys.exit(f"usage: python -m aria.device {CHECK_BF16_FLAG}")

@@ -1196,9 +1196,13 @@ def bf16_supported(device: str) -> bool:
             # Metal's bfloat16 depends on the macOS version and is not
             # reliably faster; an Apple GPU stays in float32.
             return False
-        return bool(torch.ops.mkldnn._is_mkldnn_bf16_supported())
+        if not torch.ops.mkldnn._is_mkldnn_bf16_supported():
+            return False
     except (AttributeError, RuntimeError):
         return False
+    # The CPU says it can; make sure it really can (see cpu_bf16_works).
+    from .device import cpu_bf16_works
+    return cpu_bf16_works()
 
 
 def drive(gen: Generator[LearnProgress, None, UpdateReport],
